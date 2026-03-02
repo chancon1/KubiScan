@@ -3,29 +3,17 @@
 ######################### REGION - Risky permissions combinations #########################
 
 # The order is important !
+# Patterns are ordered by priority (CRITICAL first, then HIGH, MEDIUM, LOW)
+# because the scanner breaks on the first match.
 
 ######################### REGION - CRITICAL Roles #########################
 
-# Risk: Viewing specific secrets
-# Verb: get
-# Resources: secrets
-# Example: kubectl get secrets <secret_name>
-
 items:
 
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-get-secrets
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["*"]
-    resources: ["secrets"]
-    verbs: ["get"]
-
-# Risk: Viewing all secrets
+# Risk: Viewing all secrets (returns full secret data, not just names)
 # Verb: list
 # Resources: secrets
+# Reference: OWASP K03, K8s RBAC Good Practices
 # Example: kubectl get secrets -o yaml
 
 - kind: Role
@@ -38,10 +26,28 @@ items:
     resources: ["secrets"]
     verbs: ["list"]
 
-# Risk: Impersonate privileged groups (like "system:masters")
-# Verb: list
+# Risk: Watching all secrets in real-time (returns full secret data, equivalent to list)
+# Verb: watch
 # Resources: secrets
-# Example: kubectl get secrets -o yaml
+# Reference: OWASP K03 - watch returns full item contents
+# Example: kubectl get secrets --watch -o yaml
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-watch-secrets
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["secrets"]
+    verbs: ["watch"]
+
+# Risk: Impersonate privileged groups (like "system:masters")
+# Verb: impersonate
+# Resources: groups
+# Reference: K8s RBAC Good Practices - equivalent to sudo
+# Example: kubectl --as-group=system:masters ...
+
 - kind: Role
   metadata:
     namespace: default
@@ -51,6 +57,193 @@ items:
   - apiGroups: ["*"]
     resources: ["groups"]
     verbs: ["impersonate"]
+
+# Risk: Impersonate any user identity
+# Verb: impersonate
+# Resources: users
+# Reference: K8s RBAC Good Practices - equivalent to sudo
+# Example: kubectl --as=cluster-admin ...
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-impersonate-users
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["users"]
+    verbs: ["impersonate"]
+
+# Risk: Impersonate any service account
+# Verb: impersonate
+# Resources: serviceaccounts
+# Reference: K8s RBAC Good Practices - can act as any SA including controller-manager
+# Example: kubectl --as=system:serviceaccount:kube-system:default ...
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-impersonate-serviceaccounts
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["serviceaccounts"]
+    verbs: ["impersonate"]
+
+# Risk: Bypass RBAC escalation prevention - can grant any permission to any role
+# Verb: escalate
+# Resources: roles
+# Reference: K8s RBAC Good Practices, Kyverno restrict-escalation-verbs-roles
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-escalate-roles
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["roles"]
+    verbs: ["escalate"]
+
+# Risk: Bypass RBAC escalation prevention on cluster-wide roles
+# Verb: escalate
+# Resources: clusterroles
+# Reference: K8s RBAC Good Practices, Kyverno restrict-escalation-verbs-roles
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-escalate-clusterroles
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["clusterroles"]
+    verbs: ["escalate"]
+
+# Risk: Mint long-lived tokens for any service account (persistence without trace)
+# Verb: create
+# Resources: serviceaccounts/token
+# Reference: Datadog Security Labs, K8s RBAC Good Practices
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-serviceaccount-token
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+
+# Risk: Getting shell on pods (direct arbitrary command execution)
+#   GroupA:
+#       Verb: create
+#       Resource: pods/exec
+#   GroupB:
+#       Verb: get
+#       Resource: pods
+# Reference: SentinelOne, Unit42 - one-step privilege escalation
+# Example: kubectl exec podname -it sh
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-exec-pods
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: ["*"]
+    resources: ["pods"]
+    verbs: ["get"]
+
+# Risk: Privilege Escalation from Node/Proxy (bypasses audit log and admission control)
+# Verb: get, create
+# Resources: nodes/proxy
+# Reference: K8s RBAC Good Practices, Aqua Security - even GET is not read-only (WebSocket)
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-execute-command-node-proxy
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["nodes/proxy"]
+    verbs: ["get", "create"]
+
+# Risk: Allowing creation of rolebinding and associate privileged role to itself
+#   GroupA:
+#       Verb: create
+#       Resource: rolebindings
+#   GroupB:
+#       Verb: bind
+#       Resource: roles
+#       resourceNames: privilegedRoles
+# Reference: SCHUTZWERK, K8s RBAC Docs
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-rolebinding-role
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["create"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles"]
+    verbs: ["bind"]
+    resourceNames: ["*"]
+
+# Risk: Allowing creation of rolebinding and associate privileged clusterrole to itself
+#   GroupA:
+#       Verb: create
+#       Resource: rolebindings
+#   GroupB:
+#       Verb: bind
+#       Resource: clusterroles
+#       resourceNames: privilegedRoles
+# Reference: SCHUTZWERK, K8s RBAC Docs
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-rolebinding-clusterrole
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["create"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["bind"]
+    resourceNames: ["*"]
+
+# Risk: Allowing creation of clusterrolebinding and associate privileged clusterrole to itself
+#   GroupA:
+#       Verb: create
+#       Resource: clusterrolebinding
+#   GroupB:
+#       Verb: bind
+#       Resource: clusterroles
+#       resourceNames: privilegedRoles
+# Reference: SCHUTZWERK, K8s RBAC Docs
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-clusterrolebinding-clusterrole
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings"]
+    verbs: ["create"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["bind"]
+    resourceNames: ["*"]
 
 ######################### REGION - Any Any Roles #########################
 
@@ -66,7 +259,7 @@ items:
 
 ######################### END REGION - Any Any Roles #########################
 
-######################### REGION - Any verb Roles #########################
+######################### REGION - Any verb on sensitive resources (CRITICAL) #########################
 
 - kind: Role
   metadata:
@@ -81,86 +274,6 @@ items:
 - kind: Role
   metadata:
     namespace: default
-    name: risky-any-verb-pods
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["*"]
-    resources: ["pods"]
-    verbs: ["*"]
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-any-verb-deployments
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["*"]
-    resources: ["deployments"]
-    verbs: ["*"]
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-any-verb-daemonsets
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["*"]
-    resources: ["daemonsets"]
-    verbs: ["*"]
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-any-verb-statefulsets
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["*"]
-    resources: ["statefulsets"]
-    verbs: ["*"]
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-any-verb-replicationcontrollers
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["*"]
-    resources: ["replicationcontrollers"]
-    verbs: ["*"]
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-any-verb-replicasets
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["*"]
-    resources: ["replicasets"]
-    verbs: ["*"]
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-any-verb-cronjobs
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["*"]
-    resources: ["cronjobs"]
-    verbs: ["*"]
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-any-verb-jobs
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["*"]
-    resources: ["jobs"]
-    verbs: ["*"]
-
-  - kind: Role
-  metadata:
-    namespace: default
     name: risky-any-verb-roles
     priority: CRITICAL
   rules:
@@ -168,7 +281,7 @@ items:
     resources: ["roles"]
     verbs: ["*"]
 
-  - kind: Role
+- kind: Role
   metadata:
     namespace: default
     name: risky-any-verb-clusterroles
@@ -178,7 +291,7 @@ items:
     resources: ["clusterroles"]
     verbs: ["*"]
 
-  - kind: Role
+- kind: Role
   metadata:
     namespace: default
     name: risky-any-verb-rolebindings
@@ -188,7 +301,7 @@ items:
     resources: ["rolebindings"]
     verbs: ["*"]
 
-  - kind: Role
+- kind: Role
   metadata:
     namespace: default
     name: risky-any-verb-clusterrolebindings
@@ -198,7 +311,7 @@ items:
     resources: ["clusterrolebindings"]
     verbs: ["*"]
 
-  - kind: Role
+- kind: Role
   metadata:
     namespace: default
     name: risky-any-verb-users
@@ -208,7 +321,7 @@ items:
     resources: ["users"]
     verbs: ["*"]
 
-  - kind: Role
+- kind: Role
   metadata:
     namespace: default
     name: risky-any-verb-groups
@@ -218,10 +331,10 @@ items:
     resources: ["groups"]
     verbs: ["*"]
 
-######################### END REGION - Any verb Roles #########################
-
+######################### END REGION - Any verb on sensitive resources (CRITICAL) #########################
 
 ######################### REGION - Any resource Roles #########################
+
 - kind: Role
   metadata:
     namespace: default
@@ -235,7 +348,7 @@ items:
 - kind: Role
   metadata:
     namespace: default
-    name: risky-any-resource-delete
+    name: risky-any-resource-deletecollection
     priority: CRITICAL
   rules:
   - apiGroups: ["*"]
@@ -265,16 +378,6 @@ items:
 - kind: Role
   metadata:
     namespace: default
-    name: risky-any-resource-get
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["*"]
-    resources: ["*"]
-    verbs: ["get"]
-
-- kind: Role
-  metadata:
-    namespace: default
     name: risky-any-resource-impersonate
     priority: CRITICAL
   rules:
@@ -284,297 +387,201 @@ items:
 
 ######################### END REGION - Any resource Roles #########################
 
+######################### REGION - Webhook Configuration Mutations (CRITICAL) #########################
+
+# Risk: Mutating webhooks can silently modify any object passing through the API server
+# Reference: K8s RBAC Good Practices, K8s Admission Webhook Good Practices
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-mutatingwebhookconfigurations
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["mutatingwebhookconfigurations"]
+    verbs: ["create"]
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-update-mutatingwebhookconfigurations
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["mutatingwebhookconfigurations"]
+    verbs: ["update"]
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-patch-mutatingwebhookconfigurations
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["mutatingwebhookconfigurations"]
+    verbs: ["patch"]
+
+# Risk: Validating webhooks can block operations or exfiltrate data
+# Reference: K8s RBAC Good Practices, K8s Admission Webhook Good Practices
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-validatingwebhookconfigurations
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["validatingwebhookconfigurations"]
+    verbs: ["create"]
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-update-validatingwebhookconfigurations
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["validatingwebhookconfigurations"]
+    verbs: ["update"]
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-patch-validatingwebhookconfigurations
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["validatingwebhookconfigurations"]
+    verbs: ["patch"]
+
+######################### END REGION - Webhook Configuration Mutations #########################
 
 ######################### END REGION - CRITICAL Roles #########################
 
 ######################### REGION - HIGH Roles #########################
 
-# Risk: Privilege Escalation from Node/Proxy
-# Verb: get, create
-# Resources: nodes/proxy
+# Risk: Viewing specific secrets (requires knowing name, less dangerous than list)
+# Verb: get
+# Resources: secrets
+# Reference: CyberArk, SCHUTZWERK
+# Example: kubectl get secrets <secret_name>
 
 - kind: Role
   metadata:
     namespace: default
-    name: risky-execute-command-node-proxy
+    name: risky-get-secrets
     priority: HIGH
   rules:
   - apiGroups: ["*"]
-    resources: ["nodes/proxy"]
-    verbs: ["get", "create"]
-    
-# Risk: Allowing to create a malicious pod
-# Verb: create
-# Resources: deployments
+    resources: ["secrets"]
+    verbs: ["get"]
+
+# Risk: Reading all resources including secrets
+# Verb: get
+# Resources: * (wildcard includes secrets and future resource types)
+# Reference: K8s RBAC Good Practices - wildcards include future resource types
 
 - kind: Role
   metadata:
     namespace: default
-    name: risky-create-deployments
+    name: risky-any-resource-get
+    priority: HIGH
+  rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get"]
+
+######################### REGION - Any verb on workload resources (HIGH) #########################
+# Wildcard verbs on workloads include create+delete+all operations.
+# More dangerous than individual create/update but less than CRITICAL privilege escalation.
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-any-verb-pods
+    priority: HIGH
+  rules:
+  - apiGroups: ["*"]
+    resources: ["pods"]
+    verbs: ["*"]
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-any-verb-deployments
     priority: HIGH
   rules:
   - apiGroups: ["*"]
     resources: ["deployments"]
-    verbs: ["create"]
-
-# Risk: Allowing to update a malicious pod
-# Verb: update
-# Resources: deployments
+    verbs: ["*"]
 
 - kind: Role
   metadata:
     namespace: default
-    name: risky-update-deployments
-    priority: HIGH
-  rules:
-  - apiGroups: ["*"]
-    resources: ["deployments"]
-    verbs: ["update"]
-
-# Risk: Allowing to create a malicious pod
-# Verb: create
-# Resources: daemonsets
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-create-daemonsets
+    name: risky-any-verb-daemonsets
     priority: HIGH
   rules:
   - apiGroups: ["*"]
     resources: ["daemonsets"]
-    verbs: ["create"]
-
-# Risk: Allowing to update a malicious pod
-# Verb: update
-# Resources: daemonsets
+    verbs: ["*"]
 
 - kind: Role
   metadata:
     namespace: default
-    name: risky-update-daemonsets
-    priority: HIGH
-  rules:
-  - apiGroups: ["*"]
-    resources: ["daemonsets"]
-    verbs: ["update"]
-
-# Risk: Allowing to create a malicious pod
-# Verb: create
-# Resources: statefulsets
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-create-statefulsets
+    name: risky-any-verb-statefulsets
     priority: HIGH
   rules:
   - apiGroups: ["*"]
     resources: ["statefulsets"]
-    verbs: ["create"]
-
-# Risk: Allowing to update a malicious pod
-# Verb: update
-# Resources: statefulsets
+    verbs: ["*"]
 
 - kind: Role
   metadata:
     namespace: default
-    name: risky-update-statefulsets
-    priority: HIGH
-  rules:
-  - apiGroups: ["*"]
-    resources: ["statefulsets"]
-    verbs: ["update"]
-
-# Risk: Allowing to create a malicious pod
-# Verb: create
-# Resources: replicationcontrollers
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-create-replicationcontrollers
+    name: risky-any-verb-replicationcontrollers
     priority: HIGH
   rules:
   - apiGroups: ["*"]
     resources: ["replicationcontrollers"]
-    verbs: ["create"]
-
-# Risk: Allowing to update a malicious pod
-# Verb: update
-# Resources: replicationcontrollers
+    verbs: ["*"]
 
 - kind: Role
   metadata:
     namespace: default
-    name: risky-update-replicationcontrollers
-    priority: HIGH
-  rules:
-  - apiGroups: ["*"]
-    resources: ["replicationcontrollers"]
-    verbs: ["update"]
-
-# Risk: Allowing to create a malicious pod
-# Verb: create
-# Resources: replicasets
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-create-replicasets
+    name: risky-any-verb-replicasets
     priority: HIGH
   rules:
   - apiGroups: ["*"]
     resources: ["replicasets"]
-    verbs: ["create"]
-
-# Risk: Allowing to update a malicious pod
-# Verb: update
-# Resources: replicasets
+    verbs: ["*"]
 
 - kind: Role
   metadata:
     namespace: default
-    name: risky-update-replicasets
-    priority: HIGH
-  rules:
-  - apiGroups: ["*"]
-    resources: ["replicasets"]
-    verbs: ["update"]
-
-# Risk: Allowing to create a malicious pod
-# Verb: create
-# Resources: jobs
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-create-jobs
-    priority: HIGH
-  rules:
-  - apiGroups: ["*"]
-    resources: ["jobs"]
-    verbs: ["create"]
-
-
-# Risk: Allowing to update a malicious pod
-# Verb: update
-# Resources: jobs
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-update-jobs
-    priority: HIGH
-  rules:
-  - apiGroups: ["*"]
-    resources: ["jobs"]
-    verbs: ["update"]
-
-# Risk: Allowing to create a malicious pod
-# Verb: create
-# Resources: cronjobs
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-create-jobs
+    name: risky-any-verb-cronjobs
     priority: HIGH
   rules:
   - apiGroups: ["*"]
     resources: ["cronjobs"]
-    verbs: ["create"]
-
-
-# Risk: Allowing to update a malicious pod
-# Verb: update
-# Resources: cronjobs
+    verbs: ["*"]
 
 - kind: Role
   metadata:
     namespace: default
-    name: risky-update-jobs
+    name: risky-any-verb-jobs
     priority: HIGH
   rules:
   - apiGroups: ["*"]
-    resources: ["cronjobs"]
-    verbs: ["update"]
+    resources: ["jobs"]
+    verbs: ["*"]
 
-# Risk: Allowing creation of rolebinding and associate privileged role to itself
-#   GroupA:
-#       Verb: create
-#       Resource: rolebindings
-#   GroupB:
-#       Verb: bind
-#       Resource: roles
-#       resourceNames: privilegedRoles
+######################### END REGION - Any verb on workload resources (HIGH) #########################
 
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-create-rolebinding-role
-    priority: HIGH
-  rules:
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["rolebindings"]
-    verbs: ["create"]
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["roles"]
-    verbs: ["bind"]
-    resourceNames: ["*"]
-
-# Risk: Allowing creation of rolebinding and associate privileged clusterrole to itself
-#   GroupA:
-#       Verb: create
-#       Resource: rolebindings
-#   GroupB:
-#       Verb: bind
-#       Resource: clusterroles
-#       resourceNames: privilegedRoles
-
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-create-rolebinding-clusterrole
-    priority: HIGH
-  rules:
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["rolebindings"]
-    verbs: ["create"]
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["clusterroles"]
-    verbs: ["bind"]
-    resourceNames: ["*"]
-
-# Risk: Allowing creation of clusterrolebinding and associate privileged clusterrole to itself
-#   GroupA:
-#       Verb: create
-#       Resource: clusterrolebinding
-#   GroupB:
-#       Verb: bind
-#       Resource: clusterroles
-#       resourceNames: privilegedRoles
-
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-create-clusterrolebinding-clusterrole
-    priority: HIGH
-  rules:
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["clusterrolebindings"]
-    verbs: ["create"]
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["clusterroles"]
-    verbs: ["bind"]
-    resourceNames: ["*"]
-
-# Risk: Allowing update of a malicious pod
+# Risk: Allowing creation of a malicious pod (can mount secrets, use any SA, create privileged containers)
 # Verb: create
 # Resources: pods
+# Reference: K8s RBAC Good Practices, Bishop Fox "Bad Pods"
 # Example: kubectl create -f malicious-pod.yaml
 
 - kind: Role
@@ -587,30 +594,6 @@ items:
     resources: ["pods"]
     verbs: ["create"]
 
-
-# Risk: Getting shell on pods
-#   GroupA:
-#       Verb: create
-#       Resource: pods/exec
-#   GroupB:
-#       Verb: get
-#       Resource: pods
-# Example: kubectl exec podname -it sh
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-exec-pods
-    priority: HIGH
-  rules:
-  - apiGroups: ["*"]
-    resources: ["pods/exec"]
-    verbs: ["create"]
-  - apiGroups: ["*"]
-    resources: ["pods"]
-    verbs: ["get"]
-
-
 # Risk: Attaching pod and view all its logs in realtime
 #   GroupA:
 #       Verb: create
@@ -618,8 +601,7 @@ items:
 #   GroupB:
 #       Verb: get
 #       Resource: pods
-# Example: kubectl attach podname -it sh
-
+# Example: kubectl attach podname -it
 
 - kind: Role
   metadata:
@@ -634,15 +616,386 @@ items:
     resources: ["pods"]
     verbs: ["get"]
 
+# Risk: Creating hostPath PersistentVolumes for direct host filesystem access
+# Verb: create
+# Resources: persistentvolumes
+# Reference: K8s RBAC Good Practices, Bishop Fox "Bad Pods"
 
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-persistentvolumes
+    priority: HIGH
+  rules:
+  - apiGroups: ["*"]
+    resources: ["persistentvolumes"]
+    verbs: ["create"]
+
+# Risk: Approving Certificate Signing Requests (can issue client certs for any identity)
+# Verb: update
+# Resources: certificatesigningrequests/approval
+# Reference: Aqua Security, K8s CSR Docs
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-approve-csr
+    priority: HIGH
+  rules:
+  - apiGroups: ["*"]
+    resources: ["certificatesigningrequests/approval"]
+    verbs: ["update"]
+
+# Risk: Adding ephemeral debug containers to running pods
+# Verb: patch, update
+# Resources: pods/ephemeralcontainers
+# Reference: K8s RBAC Good Practices (ephemeral containers GA since K8s 1.25)
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-patch-pods-ephemeralcontainers
+    priority: HIGH
+  rules:
+  - apiGroups: ["*"]
+    resources: ["pods/ephemeralcontainers"]
+    verbs: ["patch"]
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-update-pods-ephemeralcontainers
+    priority: HIGH
+  rules:
+  - apiGroups: ["*"]
+    resources: ["pods/ephemeralcontainers"]
+    verbs: ["update"]
 
 ######################### END REGION - HIGH Roles #########################
+
+######################### REGION - MEDIUM Roles #########################
+
+# Standard CI/CD operations (create/update/patch workloads).
+# Risk is mitigable by Pod Security Standards and admission controllers.
+# Flagged as MEDIUM to reduce false positives on legitimate CI/CD pipelines.
+# Reference: K8s built-in edit ClusterRole includes these permissions by default.
+
+# Deployments
+
+# Risk: Allowing to create a malicious pod via deployment
+# Verb: create
+# Resources: deployments
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-deployments
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["deployments"]
+    verbs: ["create"]
+
+# Risk: Allowing to update a deployment to inject malicious pod
+# Verb: update
+# Resources: deployments
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-update-deployments
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["deployments"]
+    verbs: ["update"]
+
+# Risk: Allowing to patch a deployment to inject malicious pod (equivalent to update)
+# Verb: patch
+# Resources: deployments
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-patch-deployments
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["deployments"]
+    verbs: ["patch"]
+
+# DaemonSets
+
+# Risk: Allowing to create a malicious pod via daemonset
+# Verb: create
+# Resources: daemonsets
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-daemonsets
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["daemonsets"]
+    verbs: ["create"]
+
+# Risk: Allowing to update a daemonset to inject malicious pod
+# Verb: update
+# Resources: daemonsets
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-update-daemonsets
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["daemonsets"]
+    verbs: ["update"]
+
+# Risk: Allowing to patch a daemonset to inject malicious pod (equivalent to update)
+# Verb: patch
+# Resources: daemonsets
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-patch-daemonsets
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["daemonsets"]
+    verbs: ["patch"]
+
+# StatefulSets
+
+# Risk: Allowing to create a malicious pod via statefulset
+# Verb: create
+# Resources: statefulsets
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-statefulsets
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["statefulsets"]
+    verbs: ["create"]
+
+# Risk: Allowing to update a statefulset to inject malicious pod
+# Verb: update
+# Resources: statefulsets
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-update-statefulsets
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["statefulsets"]
+    verbs: ["update"]
+
+# Risk: Allowing to patch a statefulset to inject malicious pod (equivalent to update)
+# Verb: patch
+# Resources: statefulsets
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-patch-statefulsets
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["statefulsets"]
+    verbs: ["patch"]
+
+# ReplicationControllers
+
+# Risk: Allowing to create a malicious pod via replicationcontroller
+# Verb: create
+# Resources: replicationcontrollers
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-replicationcontrollers
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["replicationcontrollers"]
+    verbs: ["create"]
+
+# Risk: Allowing to update a replicationcontroller to inject malicious pod
+# Verb: update
+# Resources: replicationcontrollers
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-update-replicationcontrollers
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["replicationcontrollers"]
+    verbs: ["update"]
+
+# Risk: Allowing to patch a replicationcontroller to inject malicious pod (equivalent to update)
+# Verb: patch
+# Resources: replicationcontrollers
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-patch-replicationcontrollers
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["replicationcontrollers"]
+    verbs: ["patch"]
+
+# ReplicaSets
+
+# Risk: Allowing to create a malicious pod via replicaset
+# Verb: create
+# Resources: replicasets
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-replicasets
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["replicasets"]
+    verbs: ["create"]
+
+# Risk: Allowing to update a replicaset to inject malicious pod
+# Verb: update
+# Resources: replicasets
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-update-replicasets
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["replicasets"]
+    verbs: ["update"]
+
+# Risk: Allowing to patch a replicaset to inject malicious pod (equivalent to update)
+# Verb: patch
+# Resources: replicasets
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-patch-replicasets
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["replicasets"]
+    verbs: ["patch"]
+
+# Jobs
+
+# Risk: Allowing to create a malicious pod via job
+# Verb: create
+# Resources: jobs
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-jobs
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["jobs"]
+    verbs: ["create"]
+
+# Risk: Allowing to update a job to inject malicious pod
+# Verb: update
+# Resources: jobs
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-update-jobs
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["jobs"]
+    verbs: ["update"]
+
+# Risk: Allowing to patch a job to inject malicious pod (equivalent to update)
+# Verb: patch
+# Resources: jobs
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-patch-jobs
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["jobs"]
+    verbs: ["patch"]
+
+# CronJobs
+
+# Risk: Allowing to create a malicious pod via cronjob (persistence vector)
+# Verb: create
+# Resources: cronjobs
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-create-cronjobs
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["cronjobs"]
+    verbs: ["create"]
+
+# Risk: Allowing to update a cronjob to inject malicious pod
+# Verb: update
+# Resources: cronjobs
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-update-cronjobs
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["cronjobs"]
+    verbs: ["update"]
+
+# Risk: Allowing to patch a cronjob to inject malicious pod (equivalent to update)
+# Verb: patch
+# Resources: cronjobs
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-patch-cronjobs
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["cronjobs"]
+    verbs: ["patch"]
+
+######################### END REGION - MEDIUM Roles #########################
 
 ######################### REGION - LOW Roles #########################
 
 # Risk: Allowing users in a rolebinding to add other users to their rolebindings
 # Verb: get, patch
 # Resources: rolebindings
+# Note: Without 'bind' verb, K8s API prevents escalation beyond current permissions
 
 - kind: Role
   metadata:
