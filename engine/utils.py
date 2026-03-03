@@ -27,7 +27,7 @@ def is_risky_resource_name_exist(source_rolename, source_resourcenames):
             # TODO: Need to allow this check also for 'roles' resource_name, should consider namespace...
             role = get_role_by_name_and_kind(resource_name, CLUSTER_ROLE_KIND)
             if role is not None:
-                is_risky, priority = is_risky_role(role)
+                is_risky, priority, _ = is_risky_role(role)
                 if is_risky:
                     break
 
@@ -133,25 +133,26 @@ def are_rules_contain_other_rules(source_role_name, source_rules, target_rules):
 
 
 def is_risky_role(role):
-    is_risky = False
-    priority = Priority.LOW
+    trigger_reasons = []
+    highest_priority = Priority.NONE
     for risky_role in STATIC_RISKY_ROLES:
         if are_rules_contain_other_rules(role.metadata.name, role.rules, risky_role.rules):
-            is_risky = True
-            priority = risky_role.priority
-            break
-
-    return is_risky, priority
+            trigger_reasons.append(risky_role.name)
+            if risky_role.priority.value > highest_priority.value:
+                highest_priority = risky_role.priority
+    if trigger_reasons:
+        return True, highest_priority, trigger_reasons
+    return False, Priority.NONE, []
 
 
 def find_risky_roles(roles, kind):
     risky_roles = []
     for role in roles:
-        is_risky, priority = is_risky_role(role)
+        is_risky, priority, trigger_reasons = is_risky_role(role)
         if is_risky:
             risky_roles.append(
                 Role(role.metadata.name, priority, rules=role.rules, namespace=role.metadata.namespace, kind=kind,
-                     time=role.metadata.creation_timestamp))
+                     time=role.metadata.creation_timestamp, trigger_reasons=trigger_reasons))
 
     return risky_roles
 
@@ -197,6 +198,42 @@ def get_risky_clusterroles():
 
 
 # endregion - Roles and ClusteRoles
+
+
+def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_crb):
+    """Return list of strings describing service accounts bound to the given role.
+
+    Format: "sa-name@sa-namespace (via RoleBinding: rb-name)"
+    Works with both live cluster and static file modes.
+    """
+    result = []
+    for rb in all_rb.items:
+        if rb.role_ref.name == role_name and rb.role_ref.kind == role_kind:
+            if role_kind == ROLE_KIND and rb.metadata.namespace != namespace:
+                continue
+            for subject in (rb.subjects or []):
+                if subject.kind == SERVICEACCOUNT_KIND:
+                    result.append(
+                        "{sa}@{ns} (via RoleBinding: {rb})".format(
+                            sa=subject.name,
+                            ns=subject.namespace,
+                            rb=rb.metadata.name
+                        )
+                    )
+    if role_kind == CLUSTER_ROLE_KIND:
+        for crb in all_crb:
+            if crb.role_ref.name == role_name and crb.role_ref.kind == role_kind:
+                for subject in (crb.subjects or []):
+                    if subject.kind == SERVICEACCOUNT_KIND:
+                        result.append(
+                            "{sa}@{ns} (via ClusterRoleBinding: {crb})".format(
+                                sa=subject.name,
+                                ns=subject.namespace,
+                                crb=crb.metadata.name
+                            )
+                        )
+    return result
+
 
 # region - RoleBindings and ClusterRoleBindings
 
