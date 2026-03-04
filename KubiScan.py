@@ -13,12 +13,17 @@ from misc import constants
 import datetime
 from api.api_client import api_init, running_in_container
 from api.client_factory import ApiClientFactory
-from api.config import set_api_client
+from api.config import set_api_client, Config
 
 json_filename = ""
 output_file = ""
 no_color = False
 curr_header = ""
+
+
+def filter_system_roles(roles):
+    """Exclude Kubernetes built-in system roles (names starting with 'system:')."""
+    return [r for r in roles if not r.name.startswith('system:')]
 def get_color_by_priority(priority):
     color = WHITE
     if priority == Priority.CRITICAL:
@@ -51,31 +56,50 @@ def get_delta_days_from_now(date):
     current_datetime = datetime.datetime.now()
     return (current_datetime.date() - date.date()).days
 
-def print_all_risky_roles(show_rules=False, days=None, priority=None, namespace=None):
+def print_all_risky_roles(show_rules=False, days=None, priority=None, namespace=None, include_system=False):
     risky_any_roles = engine.utils.get_risky_roles_and_clusterroles()
     if namespace is not None:
         logging.warning("'-rar' switch does not expect namespace ('-ns')\n")
+    if not include_system:
+        risky_any_roles = filter_system_roles(risky_any_roles)
     if days:
         risky_any_roles = filter_objects_less_than_days(int(days), risky_any_roles)
     if priority:
         risky_any_roles = filter_objects_by_priority(priority, risky_any_roles)
+    all_rb = Config.api_client.list_role_binding_for_all_namespaces()
+    all_crb = Config.api_client.list_cluster_role_binding()
+    for role in risky_any_roles:
+        role.bound_service_accounts = engine.utils.get_service_accounts_for_role(
+            role.name, role.kind, role.namespace, all_rb, all_crb
+        )
     generic_print('|Risky Roles and ClusterRoles|', risky_any_roles, show_rules)
 
 
-def print_risky_roles(show_rules=False, days=None, priority=None, namespace=None):
+def print_risky_roles(show_rules=False, days=None, priority=None, namespace=None, include_system=False):
     risky_roles = engine.utils.get_risky_roles()
 
+    if not include_system:
+        risky_roles = filter_system_roles(risky_roles)
     if days:
         risky_roles = filter_objects_less_than_days(int(days), risky_roles)
     if priority:
         risky_roles = filter_objects_by_priority(priority, risky_roles)
 
+    all_rb = Config.api_client.list_role_binding_for_all_namespaces()
+    all_crb = Config.api_client.list_cluster_role_binding()
     filtered_risky_roles = []
     if namespace is None:
+        for role in risky_roles:
+            role.bound_service_accounts = engine.utils.get_service_accounts_for_role(
+                role.name, role.kind, role.namespace, all_rb, all_crb
+            )
         generic_print('|Risky Roles |', risky_roles, show_rules)
     else:
         for risky_role in risky_roles:
             if risky_role.namespace == namespace:
+                risky_role.bound_service_accounts = engine.utils.get_service_accounts_for_role(
+                    risky_role.name, risky_role.kind, risky_role.namespace, all_rb, all_crb
+                )
                 filtered_risky_roles.append(risky_role)
         generic_print('|Risky Roles |', filtered_risky_roles, show_rules)
 
@@ -194,14 +218,22 @@ def find_min_fixed_version(cve):
     min_version = min(versions, key=lambda x: [int(num) for num in x.split('.')])
     return min_version
 
-def print_risky_clusterroles(show_rules=False, days=None, priority=None, namespace=None):
+def print_risky_clusterroles(show_rules=False, days=None, priority=None, namespace=None, include_system=False):
     if namespace is not None:
         logging.warning("'-rcr' switch does not expect namespace ('-ns')\n")
     risky_clusterroles = engine.utils.get_risky_clusterroles()
+    if not include_system:
+        risky_clusterroles = filter_system_roles(risky_clusterroles)
     if days:
         risky_clusterroles = filter_objects_less_than_days(int(days), risky_clusterroles)
     if priority:
         risky_clusterroles = filter_objects_by_priority(priority, risky_clusterroles)
+    all_rb = Config.api_client.list_role_binding_for_all_namespaces()
+    all_crb = Config.api_client.list_cluster_role_binding()
+    for role in risky_clusterroles:
+        role.bound_service_accounts = engine.utils.get_service_accounts_for_role(
+            role.name, role.kind, role.namespace, all_rb, all_crb
+        )
     generic_print('|Risky ClusterRoles |', risky_clusterroles, show_rules)
 
 def print_all_risky_rolebindings(days=None, priority=None, namespace=None):
@@ -247,20 +279,22 @@ def generic_print(header, objects, show_rules=False):
     curr_header = header
     print(roof)
     print(header)
+    columns = ['Priority', 'Kind', 'Namespace', 'Name', 'Creation Time']
     if show_rules:
-        t = PrettyTable(['Priority', 'Kind', 'Namespace', 'Name', 'Creation Time', 'Rules'])
-        for o in objects:
-            if o.time is None:
-                t.add_row([get_color_by_priority(o.priority) + o.priority.name + WHITE, o.kind, o.namespace, o.name, 'No creation time', get_pretty_rules(o.rules)])
-            else:
-                t.add_row([get_color_by_priority(o.priority) + o.priority.name + WHITE, o.kind, o.namespace, o.name, o.time.ctime() + " (" + str(get_delta_days_from_now(o.time)) + " days)", get_pretty_rules(o.rules)])
-    else:
-        t = PrettyTable(['Priority', 'Kind', 'Namespace', 'Name', 'Creation Time'])
-        for o in objects:
-            if o.time is None:
-                t.add_row([get_color_by_priority(o.priority) + o.priority.name + WHITE, o.kind, o.namespace, o.name, 'No creation time'])
-            else:
-                t.add_row([get_color_by_priority(o.priority) + o.priority.name + WHITE, o.kind, o.namespace, o.name, o.time.ctime() + " (" + str(get_delta_days_from_now(o.time)) + " days)"])
+        columns.append('Rules')
+    columns += ['Triggered By', 'Bound Service Accounts']
+    t = PrettyTable(columns)
+    t.hrules = ALL
+    for o in objects:
+        time_str = 'No creation time' if o.time is None else (
+            o.time.ctime() + " (" + str(get_delta_days_from_now(o.time)) + " days)")
+        row = [get_color_by_priority(o.priority) + o.priority.name + WHITE,
+               o.kind, o.namespace, o.name, time_str]
+        if show_rules:
+            row.append(get_pretty_rules(o.rules))
+        row.append('\n'.join(getattr(o, 'trigger_reasons', []) or []))
+        row.append('\n'.join(getattr(o, 'bound_service_accounts', []) or []))
+        t.add_row(row)
     print_table_aligned_left(t)
 
 def print_all_risky_containers(priority=None, namespace=None, read_token_from_container=False):
@@ -699,6 +733,8 @@ Requirements:
     helper_switches.add_argument('-q', '--quiet', action='store_true', help='Hide the banner')
     helper_switches.add_argument('-j', '--json', metavar='JSON_FILENAME', help='Export to json')
     helper_switches.add_argument('-nc', '--no-color', action='store_true', help='Print without color')
+    helper_switches.add_argument('--include-system', action='store_true',
+                                 help='Include system roles (system:*) in output. They are excluded by default.')
     associated_rb_crb_to_role = opt.add_argument_group('Associated RoleBindings\ClusterRoleBindings to Role', description='Use the switch: namespace (-ns\--namespace).')
     associated_rb_crb_to_role.add_argument('-aarbr', '--associated-any-rolebindings-role', action='store', metavar='ROLE_NAME',
                                            help='Get associated RoleBindings\ClusterRoleBindings to a specific role\n'
@@ -763,11 +799,11 @@ Requirements:
     if args.cve:
         print_cve(args.cert_filename, args.client_certificate, args.client_key, args.host)
     if args.risky_roles:
-        print_risky_roles(show_rules=args.rules, days=args.less_than, priority=args.priority, namespace=args.namespace)
+        print_risky_roles(show_rules=args.rules, days=args.less_than, priority=args.priority, namespace=args.namespace, include_system=args.include_system)
     if args.risky_clusterroles:
-        print_risky_clusterroles(show_rules=args.rules, days=args.less_than, priority=args.priority, namespace=args.namespace)
+        print_risky_clusterroles(show_rules=args.rules, days=args.less_than, priority=args.priority, namespace=args.namespace, include_system=args.include_system)
     if args.risky_any_roles:
-        print_all_risky_roles(show_rules=args.rules, days=args.less_than, priority=args.priority, namespace=args.namespace)
+        print_all_risky_roles(show_rules=args.rules, days=args.less_than, priority=args.priority, namespace=args.namespace, include_system=args.include_system)
     if args.risky_rolebindings:
         print_risky_rolebindings(days=args.less_than, priority=args.priority, namespace=args.namespace)
     if args.risky_clusterrolebindings:
