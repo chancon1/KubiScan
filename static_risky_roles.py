@@ -14,11 +14,11 @@ def set_risky_roles_from_yaml(items):
             rule_obj = Rule(resources=rule['resources'], verbs=rule['verbs'])
             rules.append(rule_obj)
 
-            STATIC_RISKY_ROLES.append(Role(role['metadata']['name'],
-                                           get_priority_by_name(role['metadata']['priority']),
-                                           rules,
-                                           namespace=RISKY_NAMESPACE)
-                                      )
+        STATIC_RISKY_ROLES.append(Role(role['metadata']['name'],
+                                       get_priority_by_name(role['metadata']['priority']),
+                                       rules,
+                                       namespace=RISKY_NAMESPACE)
+                                  )
 
 with open(os.path.dirname(os.path.realpath(__file__)) + '/risky_roles.yaml', 'r') as stream:
     try:
