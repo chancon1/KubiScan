@@ -26,22 +26,6 @@ items:
     resources: ["secrets"]
     verbs: ["list"]
 
-# Risk: Watching all secrets in real-time (returns full secret data, equivalent to list)
-# Verb: watch
-# Resources: secrets
-# Reference: OWASP K03 - watch returns full item contents
-# Example: kubectl get secrets --watch -o yaml
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-watch-secrets
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["*"]
-    resources: ["secrets"]
-    verbs: ["watch"]
-
 # Risk: Impersonate privileged groups (like "system:masters")
 # Verb: impersonate
 # Resources: groups
@@ -387,6 +371,136 @@ items:
 
 ######################### END REGION - Any resource Roles #########################
 
+######################### REGION - Cluster-wide read on sensitive resources (CRITICAL) #########################
+
+# Risk: Cluster-wide visibility of network segmentation and traffic policy model
+#   GroupA:
+#       Verb: list
+#       Resource: namespaces
+#   GroupB:
+#       Verb: get, list
+#       Resource: networkpolicies
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-cluster-wide-read-networkpolicies
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["namespaces"]
+    verbs: ["list"]
+  - apiGroups: ["*"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list"]
+
+# Risk: Cluster-wide access to pod logs can expose credentials, tokens and internal data
+#   GroupA:
+#       Verb: list
+#       Resource: namespaces
+#   GroupB:
+#       Verb: get, list
+#       Resource: pods/log
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-cluster-wide-read-pod-logs
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["namespaces"]
+    verbs: ["list"]
+  - apiGroups: ["*"]
+    resources: ["pods/log"]
+    verbs: ["get", "list"]
+
+# Risk: Cluster-wide read access to external secret mappings can disclose secret architecture and flows
+#   GroupA:
+#       Verb: list
+#       Resource: namespaces
+#   GroupB:
+#       Verb: get, list
+#       Resource: externalsecrets
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-cluster-wide-read-externalsecrets
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["namespaces"]
+    verbs: ["list"]
+  - apiGroups: ["*"]
+    resources: ["externalsecrets"]
+    verbs: ["get", "list"]
+
+# Risk: Cluster-wide read access to namespace secret stores may reveal external secret backend details
+#   GroupA:
+#       Verb: list
+#       Resource: namespaces
+#   GroupB:
+#       Verb: get, list
+#       Resource: secretstores
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-cluster-wide-read-secretstores
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["namespaces"]
+    verbs: ["list"]
+  - apiGroups: ["*"]
+    resources: ["secretstores"]
+    verbs: ["get", "list"]
+
+# Risk: Cluster-wide read access to cluster-wide secret store definitions and backend references
+#   GroupA:
+#       Verb: list
+#       Resource: namespaces
+#   GroupB:
+#       Verb: get, list
+#       Resource: clustersecretstores
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-cluster-wide-read-clustersecretstores
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["namespaces"]
+    verbs: ["list"]
+  - apiGroups: ["*"]
+    resources: ["clustersecretstores"]
+    verbs: ["get", "list"]
+
+# Risk: Cluster-wide read access to secret push definitions may expose secret destination topology
+#   GroupA:
+#       Verb: list
+#       Resource: namespaces
+#   GroupB:
+#       Verb: get, list
+#       Resource: pushsecrets
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-cluster-wide-read-pushsecrets
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["namespaces"]
+    verbs: ["list"]
+  - apiGroups: ["*"]
+    resources: ["pushsecrets"]
+    verbs: ["get", "list"]
+
+######################### END REGION - Cluster-wide read on sensitive resources #########################
+
 ######################### REGION - Webhook Configuration Mutations (CRITICAL) #########################
 
 # Risk: Mutating webhooks can silently modify any object passing through the API server
@@ -491,6 +605,94 @@ items:
   - apiGroups: ["*"]
     resources: ["*"]
     verbs: ["get"]
+
+######################### REGION - Cluster-wide read on selective resources (HIGH) #########################
+
+# Risk: Cluster-wide endpoint discovery improves service mapping and lateral movement paths
+#   GroupA:
+#       Verb: list
+#       Resource: namespaces
+#   GroupB:
+#       Verb: get, list
+#       Resource: endpoints
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-cluster-wide-read-endpoints
+    priority: HIGH
+  rules:
+  - apiGroups: ["*"]
+    resources: ["namespaces"]
+    verbs: ["list"]
+  - apiGroups: ["*"]
+    resources: ["endpoints"]
+    verbs: ["get", "list"]
+
+# Risk: Cluster-wide endpoint slice visibility reveals pod-level service topology
+#   GroupA:
+#       Verb: list
+#       Resource: namespaces
+#   GroupB:
+#       Verb: get, list
+#       Resource: endpointslices
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-cluster-wide-read-endpointslices
+    priority: HIGH
+  rules:
+  - apiGroups: ["*"]
+    resources: ["namespaces"]
+    verbs: ["list"]
+  - apiGroups: ["*"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
+
+# Risk: Cluster-wide read access to configmaps can expose non-secret credentials and internal configuration
+#   GroupA:
+#       Verb: list
+#       Resource: namespaces
+#   GroupB:
+#       Verb: get, list
+#       Resource: configmaps
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-cluster-wide-read-configmaps
+    priority: HIGH
+  rules:
+  - apiGroups: ["*"]
+    resources: ["namespaces"]
+    verbs: ["list"]
+  - apiGroups: ["*"]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+
+# Risk: Cluster-wide ingress visibility can disclose exposed hosts, paths and service entry points
+#   GroupA:
+#       Verb: list
+#       Resource: namespaces
+#   GroupB:
+#       Verb: get, list
+#       Resource: ingresses
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-cluster-wide-read-ingresses
+    priority: HIGH
+  rules:
+  - apiGroups: ["*"]
+    resources: ["namespaces"]
+    verbs: ["list"]
+  - apiGroups: ["*"]
+    resources: ["ingresses"]
+    verbs: ["get", "list"]
+
+######################### END REGION - Cluster-wide read on selective resources #########################
 
 ######################### REGION - Any verb on workload resources (HIGH) #########################
 # Wildcard verbs on workloads include create+delete+all operations.
