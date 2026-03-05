@@ -204,8 +204,10 @@ def get_risky_clusterroles():
 def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_crb):
     """Return list of strings describing service accounts bound to the given role.
 
-    Format: "sa-name@sa-namespace (via RoleBinding: rb-name)"
-    Works with both live cluster and static file modes.
+    Format:
+      - "sa-name@sa-namespace (via RoleBinding: rb-namespace/rb-name)"
+      - "sa-name@sa-namespace (via ClusterRoleBinding: crb-name)"
+    Works with both live-cluster and static-file modes.
     """
     result = []
     for rb in all_rb.items:
@@ -214,10 +216,13 @@ def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_c
                 continue
             for subject in (rb.subjects or []):
                 if subject.kind == SERVICEACCOUNT_KIND:
+                    rb_namespace = rb.metadata.namespace or 'Unknown'
+                    sa_namespace = subject.namespace or rb_namespace
                     result.append(
-                        "{sa}@{ns} (via RoleBinding: {rb})".format(
+                        "{sa}@{sa_ns} (via RoleBinding: {rb_ns}/{rb})".format(
                             sa=subject.name,
-                            ns=subject.namespace,
+                            sa_ns=sa_namespace,
+                            rb_ns=rb_namespace,
                             rb=rb.metadata.name
                         )
                     )
@@ -234,7 +239,6 @@ def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_c
                             )
                         )
     return result
-
 
 # region - RoleBindings and ClusterRoleBindings
 

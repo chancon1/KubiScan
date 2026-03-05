@@ -461,6 +461,62 @@ items:
 
 ######################### REGION - HIGH Roles #########################
 
+# Risk: Broad cluster reconnaissance - listing pods and deployments reveals
+#   application architecture, container images, environment variables, service accounts.
+#   Detects roles like built-in "view" ClusterRole that enumerate resources explicitly
+#   (without wildcards) but still provide extensive cluster visibility.
+#   GroupA:
+#       Verb: list
+#       Resource: pods
+#   GroupB:
+#       Verb: list
+#       Resource: deployments
+# Reference: MITRE ATT&CK - Discovery techniques (T1613 Container and Resource Discovery)
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-broad-cluster-read
+    priority: HIGH
+  rules:
+  - apiGroups: ["*"]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: ["*"]
+    resources: ["deployments"]
+    verbs: ["list"]
+
+# Risk: Listing configmaps can expose sensitive configuration data
+#   (connection strings, API endpoints, feature flags, sometimes embedded credentials)
+# Verb: list
+# Resources: configmaps
+# Reference: CIS Kubernetes Benchmark - minimize access to configmaps
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-list-configmaps
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["configmaps"]
+    verbs: ["list"]
+
+# Risk: Listing service accounts reveals identity structure for privilege escalation planning
+# Verb: list
+# Resources: serviceaccounts
+# Reference: K8s RBAC Good Practices - reconnaissance for lateral movement
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-list-serviceaccounts
+    priority: MEDIUM
+  rules:
+  - apiGroups: ["*"]
+    resources: ["serviceaccounts"]
+    verbs: ["list"]
+
 # Risk: Viewing specific secrets (requires knowing name, less dangerous than list)
 # Verb: get
 # Resources: secrets
