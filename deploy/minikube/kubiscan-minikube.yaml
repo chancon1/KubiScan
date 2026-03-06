@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubiscan
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubiscan-sa
+  namespace: kubiscan
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubiscan-clusterrole
+rules:
+- apiGroups: ["*"]
+  resources: ["roles", "clusterroles", "rolebindings", "clusterrolebindings", "pods", "secrets"]
+  verbs: ["get", "list"]
+- apiGroups: ["*"]
+  resources: ["pods/exec"]
+  verbs: ["create", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubiscan-clusterrolebinding
+subjects:
+- kind: ServiceAccount
+  name: kubiscan-sa
+  namespace: kubiscan
+roleRef:
+  kind: ClusterRole
+  name: kubiscan-clusterrole
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kubiscan-scan
+  namespace: kubiscan
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: kubiscan
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 3456
+        runAsGroup: 3456
+      serviceAccountName: kubiscan-sa
+      restartPolicy: Never
+      containers:
+      - name: kubiscan
+        image: kubiscan:minikube
+        imagePullPolicy: Never
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 3456
+          runAsGroup: 3456
+          allowPrivilegeEscalation: false
+        command:
+        - /bin/sh
+        - -ec
+        - |
+          TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+          cat > /tmp/kubeconfig <<EOF
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - name: in-cluster
+            cluster:
+              server: https://kubernetes.default.svc
+              certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          users:
+          - name: kubiscan-sa
+            user:
+              token: ${TOKEN}
+          contexts:
+          - name: in-cluster
+            context:
+              cluster: in-cluster
+              user: kubiscan-sa
+          current-context: in-cluster
+          EOF
+          export KUBECONFIG=/tmp/kubeconfig
+          python3 /opt/kubiscan/KubiScan.py \
+            -co /tmp/kubeconfig \
+            -ctx in-cluster \
+            -rar \
+            -r \
+            -j /tmp/report.json
+          echo "JSON_REPORT_BEGIN"
+          cat /tmp/report.json
+          echo "JSON_REPORT_END"
