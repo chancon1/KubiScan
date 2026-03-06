@@ -62,25 +62,41 @@ def get_delta_days_from_now(date):
 def resolve_cluster_name(args):
     if args.file:
         return "static:{0}".format(os.path.basename(args.file))
-    if args.host:
-        return args.host
 
     kubeconfig_path = args.kube_config or os.getenv('KUBISCAN_CONFIG_PATH')
+    if running_in_container() and kubeconfig_path is None:
+        kubeconfig_path = os.getenv('KUBISCAN_CONFIG_BACKUP_PATH', '/opt/kubiscan/config_bak')
+
     try:
         list_context_kwargs = {}
         if kubeconfig_path:
             list_context_kwargs['config_file'] = os.path.abspath(kubeconfig_path)
         contexts, active_context = kube_config.list_kube_config_contexts(**list_context_kwargs)
+
+        selected_context = active_context
         if args.context:
             for context_item in contexts or []:
                 if context_item.get('name') == args.context:
-                    return context_item.get('context', {}).get('cluster', args.context)
-            return args.context
-        if active_context:
-            return active_context.get('context', {}).get('cluster', active_context.get('name', 'Unknown'))
+                    selected_context = context_item
+                    break
+            else:
+                return args.context
+
+        if selected_context:
+            context_name = selected_context.get('name')
+            cluster_name_from_context = selected_context.get('context', {}).get('cluster')
+
+            if cluster_name_from_context and cluster_name_from_context != 'kubernetes.default.svc':
+                return cluster_name_from_context
+            if context_name:
+                return context_name
+            if cluster_name_from_context:
+                return cluster_name_from_context
     except Exception:
         pass
 
+    if args.host:
+        return args.host
     return 'Unknown'
 
 def print_all_risky_roles(show_rules=False, days=None, priority=None, namespace=None, include_system=False):
