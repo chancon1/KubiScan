@@ -11,7 +11,8 @@ def set_risky_roles_from_yaml(items):
     for role in items:
         rules = []
         for rule in role['rules']:
-            rule_obj = Rule(resources=rule['resources'], verbs=rule['verbs'])
+            rule_obj = Rule(resources=rule['resources'], verbs=rule['verbs'],
+                            api_groups=rule.get('apiGroups'))
             rules.append(rule_obj)
 
         STATIC_RISKY_ROLES.append(Role(role['metadata']['name'],

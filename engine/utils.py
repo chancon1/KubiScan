@@ -48,6 +48,15 @@ def is_rule_contains_risky_rule(source_role_name, source_rule, risky_rule):
             if verb.lower() == "bind":
                 is_bind_verb_found = True
 
+    # apiGroups matching: at least one apiGroup from risky pattern must be
+    # covered by the source rule.  Wildcards on either side are honoured.
+    # If the risky pattern has no apiGroups (None) or uses ["*"], any source matches.
+    if is_contains and risky_rule.api_groups is not None and "*" not in risky_rule.api_groups:
+        source_api_groups = getattr(source_rule, 'api_groups', None) or []
+        if "*" not in source_api_groups:
+            if not any(ag in source_api_groups for ag in risky_rule.api_groups):
+                is_contains = False
+
     if is_contains and source_rule.resources is not None:
         # Resource matching: ALL risky resources must be present in source rule.
         # Wildcard: if source role has resources=["*"], it covers all resources.
