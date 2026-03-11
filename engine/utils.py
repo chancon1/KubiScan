@@ -215,8 +215,8 @@ def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_c
     """Return list of strings describing service accounts bound to the given role.
 
     Format:
-      - "sa-name@sa-namespace (via RoleBinding: rb-namespace/rb-name)"
-      - "sa-name@sa-namespace (via ClusterRoleBinding: crb-name)"
+      - "sa-name@sa-namespace [SA NS] (via RoleBinding: rb-namespace [RoleBinding NS]/rb-name [RoleBinding name])"
+      - "sa-name@sa-namespace [SA NS] (via ClusterRoleBinding: crb-name [ClusterRoleBinding name])"
     Works with both live-cluster and static-file modes.
     """
     result = []
@@ -229,7 +229,7 @@ def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_c
                     rb_namespace = rb.metadata.namespace or 'Unknown'
                     sa_namespace = subject.namespace or rb_namespace
                     result.append(
-                        "{sa}@{sa_ns} (via RoleBinding: {rb_ns}/{rb})".format(
+                        "{sa}@{sa_ns} [SA NS] (via RoleBinding: {rb_ns} [RoleBinding NS]/{rb} [RoleBinding name])".format(
                             sa=subject.name,
                             sa_ns=sa_namespace,
                             rb_ns=rb_namespace,
@@ -242,7 +242,7 @@ def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_c
                 for subject in (crb.subjects or []):
                     if subject.kind == SERVICEACCOUNT_KIND:
                         result.append(
-                            "{sa}@{ns} (via ClusterRoleBinding: {crb})".format(
+                            "{sa}@{ns} [SA NS] (via ClusterRoleBinding: {crb} [ClusterRoleBinding name])".format(
                                 sa=subject.name,
                                 ns=subject.namespace,
                                 crb=crb.metadata.name
