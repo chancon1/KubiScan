@@ -143,11 +143,29 @@ def are_rules_contain_other_rules(source_role_name, source_rules, target_rules):
     return is_contains
 
 
+def _is_wildcard_pattern(risky_role):
+    """Return True if every rule in the pattern is fully wildcard (*/*/*).
+
+    A wildcard pattern (e.g. risky-wildcard-all) semantically subsumes all
+    more specific patterns, so there is no point checking further patterns
+    once one matches.
+    """
+    return all(
+        rule.verbs == ["*"] and rule.resources == ["*"]
+        and (rule.api_groups is None or rule.api_groups == ["*"])
+        for rule in risky_role.rules
+    )
+
+
 def is_risky_role(role):
     trigger_reasons = []
     highest_priority = Priority.NONE
     for risky_role in STATIC_RISKY_ROLES:
         if are_rules_contain_other_rules(role.metadata.name, role.rules, risky_role.rules):
+            if _is_wildcard_pattern(risky_role):
+                trigger_reasons = [risky_role.name]
+                highest_priority = risky_role.priority
+                break
             trigger_reasons.append(risky_role.name)
             if risky_role.priority.value > highest_priority.value:
                 highest_priority = risky_role.priority

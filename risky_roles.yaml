@@ -5,8 +5,10 @@
 # Generated from security matrix covering: Kubernetes, Kyverno, Policy WG, Cilium, Calico
 #
 # The order is important!
-# Patterns are ordered by priority (CRITICAL first, then HIGH, MEDIUM, LOW)
-# because the scanner breaks on the first match.
+# Patterns are ordered by priority (CRITICAL first, then HIGH, MEDIUM, LOW).
+# When a fully-wildcard pattern matches (verbs/resources/apiGroups all "*"),
+# the scanner stops checking further patterns, as wildcard semantically
+# subsumes all more specific rules.
 #
 # Verb matching is AND-based: a role matches a pattern only if it contains ALL listed verbs
 # on the listed resource. Single-verb entries detect specific dangerous permissions.
