@@ -35,24 +35,25 @@ def is_risky_resource_name_exist(source_rolename, source_resourcenames):
 
 
 def is_rule_contains_risky_rule(source_role_name, source_rule, risky_rule):
-    is_contains = True
+    is_contains = False
     is_bind_verb_found = False
     is_role_resource_found = False
 
-    # Optional: uncomment and shift everything bellow till the 'return' to add any rules that have "*" in their verbs or resources.
-    # currently it is being handled in risky_roles.yaml partially
-    # if (source_rule.verbs is not None and "*" not in source_rule.verbs) and (source_rule.resources is not None and "*" not in source_rule.resources):
+    # Verb matching: OR logic - match if the source rule contains ANY of the risky verbs.
+    # Wildcard: if source role has verbs=["*"], it implicitly covers all verbs.
+    source_has_wildcard_verb = source_rule.verbs is not None and "*" in source_rule.verbs
     for verb in risky_rule.verbs:
-        if verb not in source_rule.verbs:
-            is_contains = False
-            break
-
-        if verb.lower() == "bind":
-            is_bind_verb_found = True
+        if source_has_wildcard_verb or (source_rule.verbs is not None and verb in source_rule.verbs):
+            is_contains = True
+            if verb.lower() == "bind":
+                is_bind_verb_found = True
 
     if is_contains and source_rule.resources is not None:
+        # Resource matching: ALL risky resources must be present in source rule.
+        # Wildcard: if source role has resources=["*"], it covers all resources.
+        source_has_wildcard_resource = "*" in source_rule.resources
         for resource in risky_rule.resources:
-            if resource not in source_rule.resources:
+            if not source_has_wildcard_resource and resource not in source_rule.resources:
                 is_contains = False
                 break
             if resource.lower() == "roles" or resource.lower() == "clusterroles":
