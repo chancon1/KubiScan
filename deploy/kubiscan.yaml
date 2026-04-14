@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubiscan
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubiscan-sa
+  namespace: kubiscan
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubiscan-clusterrole
+rules:
+  - apiGroups:
+      - "*"
+    resources:
+      - roles
+      - clusterroles
+      - rolebindings
+      - clusterrolebindings
+      - pods
+      - secrets
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - "*"
+    resources:
+      - pods/exec
+    verbs:
+      - create
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubiscan-clusterrolebinding
+subjects:
+  - kind: ServiceAccount
+    name: kubiscan-sa
+    namespace: kubiscan
+roleRef:
+  kind: ClusterRole
+  name: kubiscan-clusterrole
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kubiscan-scan
+  namespace: kubiscan
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: kubiscan
+      annotations:
+        splunk.com/index: "kubiscan"
+        splunk.com/sourcetype: "kube:container:kubiscan"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 3456
+        runAsGroup: 3456
+      serviceAccountName: kubiscan-sa
+      restartPolicy: Never
+      containers:
+        - name: kubiscan
+          image: chancon17/kubiscan:v1
+          imagePullPolicy: Always
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 3456
+            runAsGroup: 3456
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1500m"
+              memory: "2Gi"
