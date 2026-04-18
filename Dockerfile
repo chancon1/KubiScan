@@ -55,3 +55,8 @@ RUN set -ex \
 
 # Environment variable to know if running in a container
 ENV RUNNING_IN_A_CONTAINER=true
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

@@ -35,24 +35,34 @@ def is_risky_resource_name_exist(source_rolename, source_resourcenames):
 
 
 def is_rule_contains_risky_rule(source_role_name, source_rule, risky_rule):
-    is_contains = True
+    is_contains = False
     is_bind_verb_found = False
     is_role_resource_found = False
 
-    # Optional: uncomment and shift everything bellow till the 'return' to add any rules that have "*" in their verbs or resources.
-    # currently it is being handled in risky_roles.yaml partially
-    # if (source_rule.verbs is not None and "*" not in source_rule.verbs) and (source_rule.resources is not None and "*" not in source_rule.resources):
+    # Verb matching: OR logic - match if the source rule contains ANY of the risky verbs.
+    # Wildcard: if source role has verbs=["*"], it implicitly covers all verbs.
+    source_has_wildcard_verb = source_rule.verbs is not None and "*" in source_rule.verbs
     for verb in risky_rule.verbs:
-        if verb not in source_rule.verbs:
-            is_contains = False
-            break
+        if source_has_wildcard_verb or (source_rule.verbs is not None and verb in source_rule.verbs):
+            is_contains = True
+            if verb.lower() == "bind":
+                is_bind_verb_found = True
 
-        if verb.lower() == "bind":
-            is_bind_verb_found = True
+    # apiGroups matching: at least one apiGroup from risky pattern must be
+    # covered by the source rule.  Wildcards on either side are honoured.
+    # If the risky pattern has no apiGroups (None) or uses ["*"], any source matches.
+    if is_contains and risky_rule.api_groups is not None and "*" not in risky_rule.api_groups:
+        source_api_groups = getattr(source_rule, 'api_groups', None) or []
+        if "*" not in source_api_groups:
+            if not any(ag in source_api_groups for ag in risky_rule.api_groups):
+                is_contains = False
 
     if is_contains and source_rule.resources is not None:
+        # Resource matching: ALL risky resources must be present in source rule.
+        # Wildcard: if source role has resources=["*"], it covers all resources.
+        source_has_wildcard_resource = "*" in source_rule.resources
         for resource in risky_rule.resources:
-            if resource not in source_rule.resources:
+            if not source_has_wildcard_resource and resource not in source_rule.resources:
                 is_contains = False
                 break
             if resource.lower() == "roles" or resource.lower() == "clusterroles":
@@ -133,11 +143,29 @@ def are_rules_contain_other_rules(source_role_name, source_rules, target_rules):
     return is_contains
 
 
+def _is_wildcard_pattern(risky_role):
+    """Return True if every rule in the pattern is fully wildcard (*/*/*).
+
+    A wildcard pattern (e.g. risky-wildcard-all) semantically subsumes all
+    more specific patterns, so there is no point checking further patterns
+    once one matches.
+    """
+    return all(
+        rule.verbs == ["*"] and rule.resources == ["*"]
+        and (rule.api_groups is None or rule.api_groups == ["*"])
+        for rule in risky_role.rules
+    )
+
+
 def is_risky_role(role):
     trigger_reasons = []
     highest_priority = Priority.NONE
     for risky_role in STATIC_RISKY_ROLES:
         if are_rules_contain_other_rules(role.metadata.name, role.rules, risky_role.rules):
+            if _is_wildcard_pattern(risky_role):
+                trigger_reasons = [risky_role.name]
+                highest_priority = risky_role.priority
+                break
             trigger_reasons.append(risky_role.name)
             if risky_role.priority.value > highest_priority.value:
                 highest_priority = risky_role.priority
@@ -204,8 +232,10 @@ def get_risky_clusterroles():
 def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_crb):
     """Return list of strings describing service accounts bound to the given role.
 
-    Format: "sa-name@sa-namespace (via RoleBinding: rb-name)"
-    Works with both live cluster and static file modes.
+    Format:
+      - "sa-name@sa-namespace [SA NS] (via RoleBinding: rb-namespace [RoleBinding NS]/rb-name [RoleBinding name])"
+      - "sa-name@sa-namespace [SA NS] (via ClusterRoleBinding: crb-name [ClusterRoleBinding name])"
+    Works with both live-cluster and static-file modes.
     """
     result = []
     for rb in all_rb.items:
@@ -214,10 +244,13 @@ def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_c
                 continue
             for subject in (rb.subjects or []):
                 if subject.kind == SERVICEACCOUNT_KIND:
+                    rb_namespace = rb.metadata.namespace or 'Unknown'
+                    sa_namespace = subject.namespace or rb_namespace
                     result.append(
-                        "{sa}@{ns} (via RoleBinding: {rb})".format(
+                        "{sa}@{sa_ns} [SA NS] (via RoleBinding: {rb_ns} [RoleBinding NS]/{rb} [RoleBinding name])".format(
                             sa=subject.name,
-                            ns=subject.namespace,
+                            sa_ns=sa_namespace,
+                            rb_ns=rb_namespace,
                             rb=rb.metadata.name
                         )
                     )
@@ -227,14 +260,13 @@ def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_c
                 for subject in (crb.subjects or []):
                     if subject.kind == SERVICEACCOUNT_KIND:
                         result.append(
-                            "{sa}@{ns} (via ClusterRoleBinding: {crb})".format(
+                            "{sa}@{ns} [SA NS] (via ClusterRoleBinding: {crb} [ClusterRoleBinding name])".format(
                                 sa=subject.name,
                                 ns=subject.namespace,
                                 crb=crb.metadata.name
                             )
                         )
     return result
-
 
 # region - RoleBindings and ClusterRoleBindings
 

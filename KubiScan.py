@@ -4,6 +4,7 @@ import os
 import re
 import sys
 from argparse import ArgumentParser
+from kubernetes import config as kube_config
 import engine.utils
 import engine.privleged_containers
 from prettytable import PrettyTable, ALL
@@ -19,6 +20,7 @@ json_filename = ""
 output_file = ""
 no_color = False
 curr_header = ""
+cluster_name = "Unknown"
 
 
 def filter_system_roles(roles):
@@ -55,6 +57,47 @@ def filter_objects_by_priority(priority, objects):
 def get_delta_days_from_now(date):
     current_datetime = datetime.datetime.now()
     return (current_datetime.date() - date.date()).days
+
+
+def resolve_cluster_name(args):
+    if args.file:
+        return "static:{0}".format(os.path.basename(args.file))
+
+    kubeconfig_path = args.kube_config or os.getenv('KUBISCAN_CONFIG_PATH')
+    if running_in_container() and kubeconfig_path is None:
+        kubeconfig_path = os.getenv('KUBISCAN_CONFIG_BACKUP_PATH', '/opt/kubiscan/config_bak')
+
+    try:
+        list_context_kwargs = {}
+        if kubeconfig_path:
+            list_context_kwargs['config_file'] = os.path.abspath(kubeconfig_path)
+        contexts, active_context = kube_config.list_kube_config_contexts(**list_context_kwargs)
+
+        selected_context = active_context
+        if args.context:
+            for context_item in contexts or []:
+                if context_item.get('name') == args.context:
+                    selected_context = context_item
+                    break
+            else:
+                return args.context
+
+        if selected_context:
+            context_name = selected_context.get('name')
+            cluster_name_from_context = selected_context.get('context', {}).get('cluster')
+
+            if cluster_name_from_context and cluster_name_from_context != 'kubernetes.default.svc':
+                return cluster_name_from_context
+            if context_name:
+                return context_name
+            if cluster_name_from_context:
+                return cluster_name_from_context
+    except Exception:
+        pass
+
+    if args.host:
+        return args.host
+    return 'Unknown'
 
 def print_all_risky_roles(show_rules=False, days=None, priority=None, namespace=None, include_system=False):
     risky_any_roles = engine.utils.get_risky_roles_and_clusterroles()
@@ -279,7 +322,8 @@ def generic_print(header, objects, show_rules=False):
     curr_header = header
     print(roof)
     print(header)
-    columns = ['Priority', 'Kind', 'Namespace', 'Name', 'Creation Time']
+    global cluster_name
+    columns = ['Priority', 'Cluster Name', 'Kind', 'Namespace', 'Name', 'Creation Time']
     if show_rules:
         columns.append('Rules')
     columns += ['Triggered By', 'Bound Service Accounts']
@@ -288,7 +332,7 @@ def generic_print(header, objects, show_rules=False):
     for o in objects:
         time_str = 'No creation time' if o.time is None else (
             o.time.ctime() + " (" + str(get_delta_days_from_now(o.time)) + " days)")
-        row = [get_color_by_priority(o.priority) + o.priority.name + WHITE,
+        row = [get_color_by_priority(o.priority) + o.priority.name + WHITE, cluster_name,
                o.kind, o.namespace, o.name, time_str]
         if show_rules:
             row.append(get_pretty_rules(o.rules))
@@ -794,6 +838,8 @@ Requirements:
         api_init(kube_config_file=args.kube_config, host=args.host, token_filename=args.token_filename, cert_filename=args.cert_filename, context=args.context)
     
     set_api_client(api_client)
+    global cluster_name
+    cluster_name = resolve_cluster_name(args)
 
 
     if args.cve:
