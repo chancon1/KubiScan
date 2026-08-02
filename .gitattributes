@@ -1,0 +1,11 @@
+# Shell scripts must keep LF endings even when checked out on Windows.
+# With CRLF the shebang becomes "#!/bin/sh\r", so the kernel looks for an
+# interpreter named "/bin/sh\r" and the container fails to start with
+# "exec /entrypoint.sh: no such file or directory".
+*.sh text eol=lf
+entrypoint.sh text eol=lf
+
+# Manifests and Dockerfiles are consumed by Linux tooling as well.
+*.yaml text eol=lf
+*.yml text eol=lf
+Dockerfile* text eol=lf

@@ -71,7 +71,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: kubiscan
-          image: chancon17/kubiscan:v1
+          image: chancon17/kubiscan:v2
           imagePullPolicy: Always
           securityContext:
             runAsNonRoot: true
