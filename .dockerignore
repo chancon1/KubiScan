@@ -1,0 +1,46 @@
+# The image does `COPY . /opt/kubiscan`, and .gitignore has no effect on a
+# Docker build - only this file does. Without it the build sweeps in whatever
+# happens to sit in the working directory: the v1 image shipped a 79 MB .venv
+# and a 90 MB dist/kubiscan-minikube.tar, tripling its size.
+
+# Version control and local tooling
+.git
+.gitignore
+.gitattributes
+.claude
+.idea
+.vscode
+
+# Virtualenvs
+.venv
+venv
+env
+ENV
+
+# Build and packaging output
+dist
+build
+*.egg-info
+*.egg
+*.spec
+
+# Python bytecode and caches
+__pycache__
+*.py[cod]
+.mypy_cache
+.pytest_cache
+.coverage
+coverage.xml
+
+# Scratch files
+tmp_*
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Container and deployment definitions are not needed at runtime
+Dockerfile*
+DockerHubDockerfile*
+.dockerignore
+deploy
