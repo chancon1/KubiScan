@@ -70,3 +70,6 @@ __pycache__/
 
 # Windows
 Thumbs.db
+
+# Local scratch copies of the risky-roles matrix
+tmp_*

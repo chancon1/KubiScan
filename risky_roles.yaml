@@ -422,8 +422,10 @@ items:
     name: risky-impersonate-userextras
     priority: HIGH
   rules:
+  # The API always spells these as a subresource ("userextras/scopes"), never
+  # as a bare "userextras", so the pattern has to cover the whole subtree.
   - apiGroups: ["authentication.k8s.io"]
-    resources: ["userextras"]
+    resources: ["userextras/*"]
     verbs: ["impersonate"]
 
 # ---- Kubernetes: Workload execution ----
@@ -1037,20 +1039,25 @@ items:
 
 # ---- Kubernetes: Control-plane bypass risks ----
 
-# Risk: nonResourceURL access should be tightly controlled; some paths expose metrics/health/debug
-# Resource: nonResourceURLs | Scope: Cluster
-# Impact: Bypass / Recon
+# Risk: the /debug endpoints expose pprof, whose heap dumps can contain tokens and
+#       secret material the API server held in memory
+# Resource: nonResourceURLs /debug/* | Scope: Cluster
+# Impact: Credential exposure / Recon
 # Reference: https://kubernetes.io/docs/concepts/security/api-server-bypass-risks/
+#
+# Note: nonResourceURLs is a field of its own in RBAC, not a resource name. Only
+# the sensitive paths are listed here - every authenticated user legitimately
+# holds /healthz, /version and /api through system:discovery, so matching all
+# non-resource URLs would be pure noise.
 
 - kind: Role
   metadata:
     namespace: default
-    name: risky-nonresourceurls
+    name: risky-nonresourceurls-debug
     priority: MEDIUM
   rules:
-  - apiGroups: [""]
-    resources: ["nonResourceURLs"]
-    verbs: ["get", "post"]
+  - nonResourceURLs: ["/debug/*"]
+    verbs: ["get", "post", "*"]
 
 # ---- Kubernetes: Configuration ----
 

@@ -91,10 +91,11 @@ class StaticApiClient(BaseApiClient):
                 metadata =self.parse_metadata(item['metadata']),
                 rules=[
                         V1PolicyRule(
-                            api_groups=rule.get('apiGroups', []), 
-                            resources=rule.get('resources', []), 
-                            verbs=rule.get('verbs', []), 
-                            resource_names=rule.get('resourceNames', [])  
+                            api_groups=rule.get('apiGroups', []),
+                            resources=rule.get('resources', []),
+                            verbs=rule.get('verbs', []),
+                            resource_names=rule.get('resourceNames', []),
+                            non_resource_ur_ls=rule.get('nonResourceURLs', [])
                         ) for rule in item.get('rules', [])
                     ]
             )

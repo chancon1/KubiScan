@@ -65,6 +65,48 @@ def format_trigger_reason(pattern_name, match_details):
     return '\n'.join([pattern_name] + ['  ' + detail for detail in match_details])
 
 
+def _non_resource_url_matches(source_url, risky_url):
+    """Does a granted non-resource URL cover the one a pattern looks for?
+
+    RBAC allows a trailing '*' on either side ('/debug/*'), so compare by prefix
+    whenever one is present and fall back to equality otherwise.
+    """
+    source_prefix = source_url[:-1] if source_url.endswith('*') else None
+    risky_prefix = risky_url[:-1] if risky_url.endswith('*') else None
+
+    if source_prefix is not None and risky_prefix is not None:
+        return source_prefix.startswith(risky_prefix) or risky_prefix.startswith(source_prefix)
+    if source_prefix is not None:
+        return risky_url.startswith(source_prefix)
+    if risky_prefix is not None:
+        return source_url.startswith(risky_prefix)
+    return source_url == risky_url
+
+
+def do_non_resource_urls_contain(source_rule, risky_urls):
+    source_urls = getattr(source_rule, 'non_resource_ur_ls', None) or []
+    return any(_non_resource_url_matches(source_url, risky_url)
+               for risky_url in risky_urls
+               for source_url in source_urls)
+
+
+def _resource_matches(source_resources, risky_resource):
+    """Whether a granted resource list covers one resource of a pattern.
+
+    Understands subresource wildcards in both directions: a pattern asking for
+    'userextras/*' is satisfied by 'userextras/scopes', and a role granting
+    'pods/*' satisfies a pattern asking for 'pods/exec'.
+    """
+    if '*' in source_resources or risky_resource in source_resources:
+        return True
+    if risky_resource.endswith('/*'):
+        prefix = risky_resource[:-1]
+        if any(resource.startswith(prefix) for resource in source_resources):
+            return True
+    return any(resource.endswith('/*') and risky_resource.startswith(resource[:-1])
+               for resource in source_resources)
+
+
 def is_rule_contains_risky_rule(source_role_name, source_rule, risky_rule):
     is_contains = False
     is_bind_verb_found = False
@@ -79,6 +121,12 @@ def is_rule_contains_risky_rule(source_role_name, source_rule, risky_rule):
             if verb.lower() == "bind":
                 is_bind_verb_found = True
 
+    # A non-resource URL pattern is matched against its own field; such rules
+    # carry neither apiGroups nor resources, so the checks below do not apply.
+    risky_non_resource_urls = getattr(risky_rule, 'non_resource_ur_ls', None)
+    if risky_non_resource_urls:
+        return is_contains and do_non_resource_urls_contain(source_rule, risky_non_resource_urls)
+
     # apiGroups matching: at least one apiGroup from risky pattern must be
     # covered by the source rule.  Wildcards on either side are honoured.
     # If the risky pattern has no apiGroups (None) or uses ["*"], any source matches.
@@ -91,9 +139,8 @@ def is_rule_contains_risky_rule(source_role_name, source_rule, risky_rule):
     if is_contains and source_rule.resources is not None:
         # Resource matching: ALL risky resources must be present in source rule.
         # Wildcard: if source role has resources=["*"], it covers all resources.
-        source_has_wildcard_resource = "*" in source_rule.resources
-        for resource in risky_rule.resources:
-            if not source_has_wildcard_resource and resource not in source_rule.resources:
+        for resource in risky_rule.resources or []:
+            if not _resource_matches(source_rule.resources, resource):
                 is_contains = False
                 break
             if resource.lower() == "roles" or resource.lower() == "clusterroles":

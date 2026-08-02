@@ -24,6 +24,32 @@ curr_header = ""
 def filter_system_roles(roles):
     """Exclude Kubernetes built-in system roles (names starting with 'system:')."""
     return [r for r in roles if not r.name.startswith('system:')]
+
+
+def filter_system_bindings(bindings):
+    """Exclude the bindings Kubernetes ships with itself.
+
+    Only the binding's own name is considered. A binding somebody created to
+    hand a built-in role to a new subject is a deliberate grant, not built-in
+    noise, so it stays in the report.
+    """
+    return [b for b in bindings if not b.name.startswith('system:')]
+
+
+def filter_system_subjects(subjects):
+    """Exclude subjects whose risk comes solely from built-in system roles.
+
+    The subject's own name is deliberately not used here: a group such as
+    'system:authenticated' holding a custom risky role is the most severe
+    finding there is, and filtering by name would hide exactly that.
+    """
+    kept = []
+    for subject in subjects:
+        roles = getattr(subject, 'roles', []) or []
+        if roles and all(role.name.startswith('system:') for role in roles):
+            continue
+        kept.append(subject)
+    return kept
 def get_color_by_priority(priority):
     color = WHITE
     if priority == Priority.CRITICAL:
@@ -237,18 +263,22 @@ def print_risky_clusterroles(show_rules=False, days=None, priority=None, namespa
         )
     generic_print('|Risky ClusterRoles |', risky_clusterroles, show_rules)
 
-def print_all_risky_rolebindings(days=None, priority=None, namespace=None):
+def print_all_risky_rolebindings(days=None, priority=None, namespace=None, include_system=False):
     if namespace is not None:
         logging.warning("'-rab' switch does not expect namespace ('-ns')\n")
     risky_any_rolebindings = engine.utils.get_all_risky_rolebinding()
+    if not include_system:
+        risky_any_rolebindings = filter_system_bindings(risky_any_rolebindings)
     if days:
         risky_any_rolebindings = filter_objects_less_than_days(int(days), risky_any_rolebindings)
     if priority:
         risky_any_rolebindings = filter_objects_by_priority(priority, risky_any_rolebindings)
     generic_print('|Risky RoleBindings and ClusterRoleBindings|', risky_any_rolebindings)
 
-def print_risky_rolebindings(days=None, priority=None, namespace=None):
+def print_risky_rolebindings(days=None, priority=None, namespace=None, include_system=False):
     risky_rolebindings = engine.utils.get_risky_rolebindings()
+    if not include_system:
+        risky_rolebindings = filter_system_bindings(risky_rolebindings)
 
     if days:
         risky_rolebindings = filter_objects_less_than_days(int(days), risky_rolebindings)
@@ -264,10 +294,12 @@ def print_risky_rolebindings(days=None, priority=None, namespace=None):
                 filtered_risky_rolebindings.append(risky_rolebinding)
         generic_print('|Risky RoleBindings|', filtered_risky_rolebindings)
 
-def print_risky_clusterrolebindings(days=None, priority=None, namespace=None):
+def print_risky_clusterrolebindings(days=None, priority=None, namespace=None, include_system=False):
     if namespace is not None:
         logging.warning("'-rcb' switch does not expect namespace ('-ns')\n")
     risky_clusterrolebindings = engine.utils.get_risky_clusterrolebindings()
+    if not include_system:
+        risky_clusterrolebindings = filter_system_bindings(risky_clusterrolebindings)
     if days:
         risky_clusterrolebindings = filter_objects_less_than_days(int(days), risky_clusterrolebindings)
     if priority:
@@ -331,8 +363,10 @@ def get_subject_rules(subject):
         blocks.append('{0} ({1}):\n{2}'.format(role.name, role.kind, get_pretty_rules(role.rules)))
     return '\n'.join(blocks)
 
-def print_all_risky_subjects(show_rules=False, priority=None, namespace=None):
+def print_all_risky_subjects(show_rules=False, priority=None, namespace=None, include_system=False):
     subjects = engine.utils.get_all_risky_subjects()
+    if not include_system:
+        subjects = filter_system_subjects(subjects)
     if priority:
         subjects = filter_objects_by_priority(priority, subjects)
     global curr_header
@@ -352,11 +386,11 @@ def print_all_risky_subjects(show_rules=False, priority=None, namespace=None):
 
     print_table_aligned_left(t)
 
-def print_all(days=None, priority=None, read_token_from_container=False):
-    print_all_risky_roles(days=days, priority=priority)
-    print_all_risky_rolebindings(days=days, priority=priority)
-    print_all_risky_subjects(priority=priority)
-    print_all_risky_containers(priority=priority, read_token_from_container=False)
+def print_all(days=None, priority=None, read_token_from_container=False, include_system=False):
+    print_all_risky_roles(days=days, priority=priority, include_system=include_system)
+    print_all_risky_rolebindings(days=days, priority=priority, include_system=include_system)
+    print_all_risky_subjects(priority=priority, include_system=include_system)
+    print_all_risky_containers(priority=priority, read_token_from_container=read_token_from_container)
 
 def print_associated_rolebindings_to_role(role_name, namespace=None):
     associated_rolebindings = engine.utils.get_rolebindings_associated_to_role(role_name=role_name, namespace=namespace)
@@ -435,17 +469,25 @@ def get_pretty_rules(rules):
     pretty = ''
     if rules is not None:
         for rule in rules:
-            # Lead with the apiGroup: the same resource name can exist in several
-            # groups, so verbs alone do not identify what the rule really grants.
-            api_groups = getattr(rule, 'api_groups', None) or ['?']
-            groups_string = '[' + ','.join(
-                engine.utils.format_api_group(group) for group in api_groups) + '] '
-
             verbs_string = '('
             for verb in rule.verbs:
                 verbs_string += verb + ','
             verbs_string = verbs_string[:-1]
             verbs_string += ')->'
+
+            # A non-resource URL rule has neither apiGroups nor resources; it
+            # grants raw HTTP paths on the API server.
+            non_resource_urls = getattr(rule, 'non_resource_ur_ls', None)
+            if non_resource_urls:
+                pretty += '[nonResourceURLs] {0}({1})\n'.format(
+                    verbs_string, ','.join(non_resource_urls))
+                continue
+
+            # Lead with the apiGroup: the same resource name can exist in several
+            # groups, so verbs alone do not identify what the rule really grants.
+            api_groups = getattr(rule, 'api_groups', None) or ['?']
+            groups_string = '[' + ','.join(
+                engine.utils.format_api_group(group) for group in api_groups) + '] '
 
             resources_string = '('
             if rule.resources is None:
@@ -814,20 +856,20 @@ Requirements:
     if args.risky_any_roles:
         print_all_risky_roles(show_rules=args.rules, days=args.less_than, priority=args.priority, namespace=args.namespace, include_system=args.include_system)
     if args.risky_rolebindings:
-        print_risky_rolebindings(days=args.less_than, priority=args.priority, namespace=args.namespace)
+        print_risky_rolebindings(days=args.less_than, priority=args.priority, namespace=args.namespace, include_system=args.include_system)
     if args.risky_clusterrolebindings:
-        print_risky_clusterrolebindings(days=args.less_than, priority=args.priority, namespace=args.namespace)
+        print_risky_clusterrolebindings(days=args.less_than, priority=args.priority, namespace=args.namespace, include_system=args.include_system)
     if args.risky_any_rolebindings:
-        print_all_risky_rolebindings(days=args.less_than, priority=args.priority, namespace=args.namespace)
+        print_all_risky_rolebindings(days=args.less_than, priority=args.priority, namespace=args.namespace, include_system=args.include_system)
     if args.risky_subjects:
-        print_all_risky_subjects(show_rules=args.rules,priority=args.priority, namespace=args.namespace)
+        print_all_risky_subjects(show_rules=args.rules, priority=args.priority, namespace=args.namespace, include_system=args.include_system)
     if args.risky_pods:
         if args.deep and args.file:
             print('Cannot access pods token in a static scan. In static scan use -rp only.')
         else:
             print_all_risky_containers(priority=args.priority, namespace=args.namespace, read_token_from_container=args.deep)
     if args.all:
-        print_all(days=args.less_than, priority=args.priority, read_token_from_container=args.deep)
+        print_all(days=args.less_than, priority=args.priority, read_token_from_container=args.deep, include_system=args.include_system)
     elif args.privleged_pods:
         print_privileged_containers(namespace=args.namespace)
     elif args.join_token:
