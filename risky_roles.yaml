@@ -10,9 +10,13 @@
 # the scanner stops checking further patterns, as wildcard semantically
 # subsumes all more specific rules.
 #
-# Verb matching is AND-based: a role matches a pattern only if it contains ALL listed verbs
-# on the listed resource. Single-verb entries detect specific dangerous permissions.
+# Verb matching is OR-based: a role matches a pattern if it contains ANY of the listed
+# verbs on the listed resource. Single-verb entries detect specific dangerous permissions.
 # The wildcard entry ("*") catches roles with unrestricted verb access.
+#
+# apiGroups must name the group the resource really lives in - "" for the core group.
+# Using "*" here disables the group check entirely, which makes an unrelated CRD of the
+# same name (e.g. "secrets" in a vendor group) match a Kubernetes-native pattern.
 
 ######################### REGION - CRITICAL #########################
 
@@ -93,7 +97,7 @@ items:
     name: risky-impersonate-users
     priority: CRITICAL
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["users"]
     verbs: ["impersonate"]
 
@@ -108,7 +112,7 @@ items:
     name: risky-impersonate-groups
     priority: CRITICAL
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["groups"]
     verbs: ["impersonate"]
 
@@ -123,7 +127,7 @@ items:
     name: risky-impersonate-serviceaccounts
     priority: CRITICAL
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["serviceaccounts"]
     verbs: ["impersonate"]
 
@@ -156,7 +160,7 @@ items:
     name: risky-serviceaccount-token
     priority: CRITICAL
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["serviceaccounts/token"]
     verbs: ["create"]
 
@@ -173,7 +177,7 @@ items:
     name: risky-secrets
     priority: CRITICAL
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "*"]
 
@@ -190,7 +194,7 @@ items:
     name: risky-pods
     priority: CRITICAL
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "update", "patch", "delete", "*"]
 
@@ -205,7 +209,7 @@ items:
     name: risky-pods-exec
     priority: CRITICAL
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create"]
 
@@ -435,7 +439,7 @@ items:
     name: risky-pods-attach
     priority: HIGH
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["pods/attach"]
     verbs: ["create"]
 
@@ -450,7 +454,7 @@ items:
     name: risky-pods-portforward
     priority: HIGH
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["pods/portforward"]
     verbs: ["create"]
 
@@ -465,7 +469,7 @@ items:
     name: risky-pods-ephemeralcontainers
     priority: HIGH
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["pods/ephemeralcontainers"]
     verbs: ["update", "patch"]
 
@@ -510,7 +514,7 @@ items:
     name: risky-endpoints
     priority: HIGH
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["endpoints"]
     verbs: ["create", "update", "patch", "delete", "*"]
 
@@ -586,7 +590,7 @@ items:
     name: risky-namespaces
     priority: HIGH
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["create", "update", "patch", "delete", "*"]
 
@@ -620,7 +624,7 @@ items:
     name: risky-nodes-proxy
     priority: HIGH
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["nodes/proxy"]
     verbs: ["create", "get"]
 
@@ -637,7 +641,7 @@ items:
     name: risky-write-serviceaccounts
     priority: HIGH
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["serviceaccounts"]
     verbs: ["create", "update", "patch", "delete", "*"]
 
@@ -654,7 +658,7 @@ items:
     name: risky-persistentvolumes
     priority: HIGH
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["create", "update", "patch", "delete", "*"]
 
@@ -668,7 +672,7 @@ items:
     name: risky-persistentvolumeclaims
     priority: HIGH
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["create", "update", "patch", "delete", "*"]
 
@@ -963,7 +967,7 @@ items:
     name: risky-pods-log
     priority: MEDIUM
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
 
@@ -979,7 +983,7 @@ items:
     name: risky-services
     priority: MEDIUM
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["services"]
     verbs: ["create", "update", "patch", "delete", "*"]
 
@@ -1044,7 +1048,7 @@ items:
     name: risky-nonresourceurls
     priority: MEDIUM
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["nonResourceURLs"]
     verbs: ["get", "post"]
 
@@ -1061,7 +1065,7 @@ items:
     name: risky-configmaps
     priority: MEDIUM
   rules:
-  - apiGroups: ["*"]
+  - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "*"]
 

@@ -4,6 +4,8 @@
 # 3. ServiceAccount
 # https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/V1Subject.md
 class Subject:
-    def __init__(self, raw_info, priority):
+    def __init__(self, raw_info, priority, roles=None):
         self.user_info = raw_info
         self.priority = priority
+        # The risky roles this subject is actually bound to.
+        self.roles = roles or []

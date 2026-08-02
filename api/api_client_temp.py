@@ -678,14 +678,14 @@ class ApiClientTemp(object):
             rules = []
             if i['rules'] is not None:
                 for rule in i['rules']:
-                    resources = None
-                    if 'resources' in rule.keys():
-                        resources = rule['resources']
-                    verbs = None
-                    if 'verbs' in rule.keys():
-                        verbs = rule['verbs']
-
-                    rules.append(V1PolicyRule(resources=resources, verbs=verbs))
+                    # Every field of the rule matters: dropping apiGroups makes
+                    # each group-specific risky pattern unmatchable, and dropping
+                    # nonResourceURLs/resourceNames hides those grants entirely.
+                    rules.append(V1PolicyRule(api_groups=rule.get('apiGroups'),
+                                              resources=rule.get('resources'),
+                                              verbs=rule.get('verbs'),
+                                              resource_names=rule.get('resourceNames'),
+                                              non_resource_ur_ls=rule.get('nonResourceURLs')))
 
             cluster_role = V1ClusterRole(kind='ClusterRole', metadata=metadata, rules=rules)
             cluster_roles.append(cluster_role)

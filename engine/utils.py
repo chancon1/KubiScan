@@ -34,6 +34,37 @@ def is_risky_resource_name_exist(source_rolename, source_resourcenames):
     return is_risky
 
 
+def format_api_group(api_group):
+    """Render an apiGroup for humans. The core group is an empty string in RBAC."""
+    return 'core' if api_group == '' else api_group
+
+
+def describe_rule_match(source_rule, risky_rule):
+    """Describe which permission of 'source_rule' made it match 'risky_rule'.
+
+    Produces e.g. "[core] configmaps: get,list,watch" so a report shows the
+    apiGroup the finding came from, not just the resource name. Wildcards on
+    the source side fall back to what the pattern was looking for.
+    """
+    groups = ','.join(format_api_group(g) for g in (source_rule.api_groups or ['?']))
+
+    source_resources = source_rule.resources or []
+    resources = [r for r in (risky_rule.resources or []) if r in source_resources] \
+        or list(risky_rule.resources or [])
+
+    source_verbs = source_rule.verbs or []
+    verbs = [v for v in (risky_rule.verbs or []) if v in source_verbs] or list(source_verbs)
+
+    return '[{0}] {1}: {2}'.format(groups, ','.join(resources), ','.join(verbs))
+
+
+def format_trigger_reason(pattern_name, match_details):
+    """Pattern name followed by the concrete rule(s) that triggered it."""
+    if not match_details:
+        return pattern_name
+    return '\n'.join([pattern_name] + ['  ' + detail for detail in match_details])
+
+
 def is_rule_contains_risky_rule(source_role_name, source_rule, risky_rule):
     is_contains = False
     is_bind_verb_found = False
@@ -126,21 +157,25 @@ def get_role_by_name_and_kind(name, kind, namespace=None):
 
 
 def are_rules_contain_other_rules(source_role_name, source_rules, target_rules):
-    is_contains = False
-    matched_rules = 0
-    if not (target_rules and source_rules):
-        return is_contains
-    for target_rule in target_rules:
-        if source_rules is not None:
-            for source_rule in source_rules:
-                if is_rule_contains_risky_rule(source_role_name, source_rule, target_rule):
-                    matched_rules += 1
-                    break
-        if matched_rules == len(target_rules):
-            is_contains = True
-            return is_contains
+    """Return (is_contains, match_details).
 
-    return is_contains
+    'match_details' describes which source rule satisfied each target rule, so
+    callers can report the apiGroup/resource/verbs behind a finding.
+    """
+    matched_rules = 0
+    match_details = []
+    if not (target_rules and source_rules):
+        return False, []
+    for target_rule in target_rules:
+        for source_rule in source_rules:
+            if is_rule_contains_risky_rule(source_role_name, source_rule, target_rule):
+                matched_rules += 1
+                match_details.append(describe_rule_match(source_rule, target_rule))
+                break
+        if matched_rules == len(target_rules):
+            return True, match_details
+
+    return False, []
 
 
 def _is_wildcard_pattern(risky_role):
@@ -161,12 +196,15 @@ def is_risky_role(role):
     trigger_reasons = []
     highest_priority = Priority.NONE
     for risky_role in STATIC_RISKY_ROLES:
-        if are_rules_contain_other_rules(role.metadata.name, role.rules, risky_role.rules):
+        is_contains, match_details = are_rules_contain_other_rules(role.metadata.name, role.rules,
+                                                                  risky_role.rules)
+        if is_contains:
+            reason = format_trigger_reason(risky_role.name, match_details)
             if _is_wildcard_pattern(risky_role):
-                trigger_reasons = [risky_role.name]
+                trigger_reasons = [reason]
                 highest_priority = risky_role.priority
                 break
-            trigger_reasons.append(risky_role.name)
+            trigger_reasons.append(reason)
             if risky_role.priority.value > highest_priority.value:
                 highest_priority = risky_role.priority
     if trigger_reasons:
@@ -230,11 +268,16 @@ def get_risky_clusterroles():
 
 
 def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_crb):
-    """Return list of strings describing service accounts bound to the given role.
+    """Return list of strings describing the subjects bound to the given role.
+
+    Users and Groups are reported alongside service accounts: a risky role
+    granted to a group such as 'system:authenticated' is the most severe finding
+    there is, and listing only service accounts left that column empty.
 
     Format:
       - "sa-name@sa-namespace [SA NS] (via RoleBinding: rb-namespace [RoleBinding NS]/rb-name [RoleBinding name])"
       - "sa-name@sa-namespace [SA NS] (via ClusterRoleBinding: crb-name [ClusterRoleBinding name])"
+      - "subject-name [Group] (via ClusterRoleBinding: crb-name [ClusterRoleBinding name])"
     Works with both live-cluster and static-file modes.
     """
     result = []
@@ -242,14 +285,23 @@ def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_c
         if rb.role_ref.name == role_name and rb.role_ref.kind == role_kind:
             if role_kind == ROLE_KIND and rb.metadata.namespace != namespace:
                 continue
+            rb_namespace = rb.metadata.namespace or 'Unknown'
             for subject in (rb.subjects or []):
                 if subject.kind == SERVICEACCOUNT_KIND:
-                    rb_namespace = rb.metadata.namespace or 'Unknown'
                     sa_namespace = subject.namespace or rb_namespace
                     result.append(
                         "{sa}@{sa_ns} [SA NS] (via RoleBinding: {rb_ns} [RoleBinding NS]/{rb} [RoleBinding name])".format(
                             sa=subject.name,
                             sa_ns=sa_namespace,
+                            rb_ns=rb_namespace,
+                            rb=rb.metadata.name
+                        )
+                    )
+                else:
+                    result.append(
+                        "{name} [{kind}] (via RoleBinding: {rb_ns} [RoleBinding NS]/{rb} [RoleBinding name])".format(
+                            name=subject.name,
+                            kind=subject.kind,
                             rb_ns=rb_namespace,
                             rb=rb.metadata.name
                         )
@@ -266,34 +318,56 @@ def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_c
                                 crb=crb.metadata.name
                             )
                         )
+                    else:
+                        result.append(
+                            "{name} [{kind}] (via ClusterRoleBinding: {crb} [ClusterRoleBinding name])".format(
+                                name=subject.name,
+                                kind=subject.kind,
+                                crb=crb.metadata.name
+                            )
+                        )
     return result
 
 # region - RoleBindings and ClusterRoleBindings
 
-def is_risky_rolebinding(risky_roles, rolebinding):
-    is_risky = False
-    priority = Priority.LOW
+def get_role_referenced_by_binding(risky_roles, rolebinding):
+    """Return the risky role a binding actually points at, or None.
+
+    Matching on the name alone is not enough: a Role and a ClusterRole may share
+    a name, and a namespaced Role only applies inside its own namespace. Without
+    both checks a binding to a harmless Role inherits the priority of its
+    same-named ClusterRole.
+    """
+    role_ref = rolebinding.role_ref
     for risky_role in risky_roles:
+        if role_ref.name != risky_role.name:
+            continue
+        if role_ref.kind is not None and role_ref.kind != risky_role.kind:
+            continue
+        if risky_role.kind == ROLE_KIND and rolebinding.metadata.namespace != risky_role.namespace:
+            continue
+        return risky_role
+    return None
 
-        # It is also possible to add check for role kind
-        if rolebinding.role_ref.name == risky_role.name:
-            is_risky = True
-            priority = risky_role.priority
-            break
 
-    return is_risky, priority
+def is_risky_rolebinding(risky_roles, rolebinding):
+    risky_role = get_role_referenced_by_binding(risky_roles, rolebinding)
+    if risky_role is None:
+        return False, Priority.LOW
+    return True, risky_role.priority
 
 
 def find_risky_rolebindings_or_clusterrolebindings(risky_roles, rolebindings, kind):
     risky_rolebindings = []
     for rolebinding in rolebindings:
-        is_risky, priority = is_risky_rolebinding(risky_roles, rolebinding)
-        if is_risky:
+        risky_role = get_role_referenced_by_binding(risky_roles, rolebinding)
+        if risky_role is not None:
             risky_rolebindings.append(RoleBinding(rolebinding.metadata.name,
-                                                  priority,
+                                                  risky_role.priority,
                                                   namespace=rolebinding.metadata.namespace,
                                                   kind=kind, subjects=rolebinding.subjects,
-                                                  time=rolebinding.metadata.creation_timestamp))
+                                                  time=rolebinding.metadata.creation_timestamp,
+                                                  role_ref=risky_role))
     return risky_rolebindings
 
 
@@ -353,12 +427,28 @@ def get_all_risky_subjects():
 
         # In case 'risky_rolebinding.subjects' is 'None', 'or []' will prevent an exception.
         for user in risky_rolebinding.subjects or []:
-            # Removing duplicated users
-            if ''.join((user.kind, user.name, str(user.namespace))) not in passed_users:
-                passed_users[''.join((user.kind, user.name, str(user.namespace)))] = True
-                if user.namespace == None and (user.kind).lower() == "serviceaccount":
-                    user.namespace = risky_rolebinding.namespace
-                all_risky_users.append(Subject(user, risky_rolebinding.priority))
+            # Default the namespace before building the key, otherwise the same
+            # service account is counted twice: once as '...None' and once as
+            # '...<namespace>' depending on how each binding spelled it out.
+            if user.namespace is None and (user.kind).lower() == "serviceaccount":
+                user.namespace = risky_rolebinding.namespace
+
+            unique_name = ''.join((user.kind, user.name, str(user.namespace)))
+            existing = passed_users.get(unique_name)
+            if existing is None:
+                subject = Subject(user, risky_rolebinding.priority)
+                if risky_rolebinding.role_ref is not None:
+                    subject.roles.append(risky_rolebinding.role_ref)
+                passed_users[unique_name] = subject
+                all_risky_users.append(subject)
+                continue
+
+            # A subject is as risky as the worst role bound to it, not as the
+            # first binding the API happened to return.
+            if risky_rolebinding.priority.value > existing.priority.value:
+                existing.priority = risky_rolebinding.priority
+            if risky_rolebinding.role_ref is not None and risky_rolebinding.role_ref not in existing.roles:
+                existing.roles.append(risky_rolebinding.role_ref)
 
     return all_risky_users
 
@@ -620,7 +710,7 @@ def get_rolebindings_and_clusterrolebindings_associated_to_subject(subject_name,
 
         # In case 'clusterrolebinding.subjects' is 'None', 'or []' will prevent an exception.
         for subject in clusterrolebinding.subjects or []:
-            if subject.name == subject_name.lower() and subject.kind.lower() == kind.lower():
+            if subject.name.lower() == subject_name.lower() and subject.kind.lower() == kind.lower():
                 if kind == SERVICEACCOUNT_KIND:
                     if subject.namespace.lower() == namespace.lower():
                         associated_clusterrolebindings.append(clusterrolebinding)

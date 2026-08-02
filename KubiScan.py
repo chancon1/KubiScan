@@ -4,7 +4,6 @@ import os
 import re
 import sys
 from argparse import ArgumentParser
-from kubernetes import config as kube_config
 import engine.utils
 import engine.privleged_containers
 from prettytable import PrettyTable, ALL
@@ -20,7 +19,6 @@ json_filename = ""
 output_file = ""
 no_color = False
 curr_header = ""
-cluster_name = "Unknown"
 
 
 def filter_system_roles(roles):
@@ -58,46 +56,6 @@ def get_delta_days_from_now(date):
     current_datetime = datetime.datetime.now()
     return (current_datetime.date() - date.date()).days
 
-
-def resolve_cluster_name(args):
-    if args.file:
-        return "static:{0}".format(os.path.basename(args.file))
-
-    kubeconfig_path = args.kube_config or os.getenv('KUBISCAN_CONFIG_PATH')
-    if running_in_container() and kubeconfig_path is None:
-        kubeconfig_path = os.getenv('KUBISCAN_CONFIG_BACKUP_PATH', '/opt/kubiscan/config_bak')
-
-    try:
-        list_context_kwargs = {}
-        if kubeconfig_path:
-            list_context_kwargs['config_file'] = os.path.abspath(kubeconfig_path)
-        contexts, active_context = kube_config.list_kube_config_contexts(**list_context_kwargs)
-
-        selected_context = active_context
-        if args.context:
-            for context_item in contexts or []:
-                if context_item.get('name') == args.context:
-                    selected_context = context_item
-                    break
-            else:
-                return args.context
-
-        if selected_context:
-            context_name = selected_context.get('name')
-            cluster_name_from_context = selected_context.get('context', {}).get('cluster')
-
-            if cluster_name_from_context and cluster_name_from_context != 'kubernetes.default.svc':
-                return cluster_name_from_context
-            if context_name:
-                return context_name
-            if cluster_name_from_context:
-                return cluster_name_from_context
-    except Exception:
-        pass
-
-    if args.host:
-        return args.host
-    return 'Unknown'
 
 def print_all_risky_roles(show_rules=False, days=None, priority=None, namespace=None, include_system=False):
     risky_any_roles = engine.utils.get_risky_roles_and_clusterroles()
@@ -322,8 +280,7 @@ def generic_print(header, objects, show_rules=False):
     curr_header = header
     print(roof)
     print(header)
-    global cluster_name
-    columns = ['Priority', 'Cluster Name', 'Kind', 'Namespace', 'Name', 'Creation Time']
+    columns = ['Priority', 'Kind', 'Namespace', 'Name', 'Creation Time']
     if show_rules:
         columns.append('Rules')
     columns += ['Triggered By', 'Bound Service Accounts']
@@ -332,7 +289,7 @@ def generic_print(header, objects, show_rules=False):
     for o in objects:
         time_str = 'No creation time' if o.time is None else (
             o.time.ctime() + " (" + str(get_delta_days_from_now(o.time)) + " days)")
-        row = [get_color_by_priority(o.priority) + o.priority.name + WHITE, cluster_name,
+        row = [get_color_by_priority(o.priority) + o.priority.name + WHITE,
                o.kind, o.namespace, o.name, time_str]
         if show_rules:
             row.append(get_pretty_rules(o.rules))
@@ -362,13 +319,17 @@ def print_all_risky_containers(priority=None, namespace=None, read_token_from_co
     print_table_aligned_left(t)
 
 
-def get_rules_by_namespace(namespace=None):
-    namespace_risky_roles = []
-    risky_roles = engine.utils.get_risky_roles()
-    for role in risky_roles:
-        if role.namespace == namespace:
-            return role
-    return None
+def get_subject_rules(subject):
+    """Rules of the risky roles this subject is really bound to, labelled by role.
+
+    Looking a role up by namespace alone used to return whichever risky Role
+    happened to sit in that namespace, so the column showed rules the subject
+    never had - and nothing at all when the risk came from a ClusterRole.
+    """
+    blocks = []
+    for role in getattr(subject, 'roles', []) or []:
+        blocks.append('{0} ({1}):\n{2}'.format(role.name, role.kind, get_pretty_rules(role.rules)))
+    return '\n'.join(blocks)
 
 def print_all_risky_subjects(show_rules=False, priority=None, namespace=None):
     subjects = engine.utils.get_all_risky_subjects()
@@ -382,9 +343,7 @@ def print_all_risky_subjects(show_rules=False, priority=None, namespace=None):
         t = PrettyTable(['Priority', 'Kind', 'Namespace', 'Name', 'Rules'])
         for subject in subjects:
             if subject.user_info.namespace == namespace or namespace is None:
-                subject_role = get_rules_by_namespace(subject.user_info.namespace)
-                rules = subject_role.rules if subject_role else None
-                t.add_row([get_color_by_priority(subject.priority)+subject.priority.name+WHITE, subject.user_info.kind, subject.user_info.namespace, subject.user_info.name,get_pretty_rules(rules)])
+                t.add_row([get_color_by_priority(subject.priority)+subject.priority.name+WHITE, subject.user_info.kind, subject.user_info.namespace, subject.user_info.name, get_subject_rules(subject)])
     else:
         t = PrettyTable(['Priority', 'Kind', 'Namespace', 'Name'])
         for subject in subjects:
@@ -476,6 +435,12 @@ def get_pretty_rules(rules):
     pretty = ''
     if rules is not None:
         for rule in rules:
+            # Lead with the apiGroup: the same resource name can exist in several
+            # groups, so verbs alone do not identify what the rule really grants.
+            api_groups = getattr(rule, 'api_groups', None) or ['?']
+            groups_string = '[' + ','.join(
+                engine.utils.format_api_group(group) for group in api_groups) + '] '
+
             verbs_string = '('
             for verb in rule.verbs:
                 verbs_string += verb + ','
@@ -491,7 +456,7 @@ def get_pretty_rules(rules):
 
                 resources_string = resources_string[:-1]
             resources_string += ')\n'
-            pretty += verbs_string + resources_string
+            pretty += groups_string + verbs_string + resources_string
     return pretty
 
 def print_rolebinding_rules(rolebinding_name, namespace):
@@ -838,8 +803,6 @@ Requirements:
         api_init(kube_config_file=args.kube_config, host=args.host, token_filename=args.token_filename, cert_filename=args.cert_filename, context=args.context)
     
     set_api_client(api_client)
-    global cluster_name
-    cluster_name = resolve_cluster_name(args)
 
 
     if args.cve:

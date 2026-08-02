@@ -51,11 +51,31 @@ class StaticApiClient(BaseApiClient):
         return resources
 
 
+    @staticmethod
+    def parse_timestamp(value):
+        """Normalize a manifest timestamp into a datetime.
+
+        JSON input keeps timestamps as strings, but PyYAML resolves unquoted
+        ISO-8601 values into datetime objects on its own, so both forms reach
+        us here. Anything unparsable degrades to None rather than aborting the
+        whole scan.
+        """
+        if value is None or isinstance(value, datetime):
+            return value
+        if not isinstance(value, str):
+            return None
+        try:
+            return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            pass
+        try:
+            # Tolerate offsets and fractional seconds ('2025-05-07T06:19:17+03:00').
+            return datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+
     def parse_metadata(self, metadata_dict):
-            creation_timestamp_str = metadata_dict.get('creationTimestamp')
-            creation_timestamp = None
-            if creation_timestamp_str:
-                creation_timestamp = datetime.strptime(creation_timestamp_str, "%Y-%m-%dT%H:%M:%SZ")
+            creation_timestamp = self.parse_timestamp(metadata_dict.get('creationTimestamp'))
             return V1ObjectMeta(
                 name=metadata_dict['name'],
                 namespace=metadata_dict.get('namespace'),
@@ -151,17 +171,18 @@ class StaticApiClient(BaseApiClient):
                     namespace=metadata.get('namespace', None),
                     labels=metadata.get('labels', {}),
                     annotations=metadata.get('annotations', {}),
-                    creation_timestamp=metadata.get('creationTimestamp', None),
+                    creation_timestamp=self.parse_timestamp(metadata.get('creationTimestamp')),
                     uid=metadata.get('uid', None),
                     resource_version=metadata.get('resourceVersion', None)
                 ),
                 spec=V1PodSpec(
                     security_context=pod_security_context,
-                    service_account=spec.get('serviceAccount', None), 
+                    service_account=spec.get('serviceAccount', None),
                     service_account_name=spec.get('serviceAccountName', None),
                     node_name=spec.get('nodeName', None),
-                    host_ipc=spec.get('hostIpc', False),
-                    host_pid=spec.get('hostPid', False),  
+                    # The API serializes these as hostIPC/hostPID (uppercase acronyms).
+                    host_ipc=spec.get('hostIPC', False),
+                    host_pid=spec.get('hostPID', False),
                     host_network=spec.get('hostNetwork', False),
                     restart_policy=spec.get('restartPolicy', 'Always'),
                     containers=[
