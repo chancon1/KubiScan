@@ -226,14 +226,16 @@ def are_rules_contain_other_rules(source_role_name, source_rules, target_rules):
 
 
 def _is_wildcard_pattern(risky_role):
-    """Return True if every rule in the pattern is fully wildcard (*/*/*).
+    """Return True if the pattern covers every resource of every API group.
 
-    A wildcard pattern (e.g. risky-wildcard-all) semantically subsumes all
-    more specific patterns, so there is no point checking further patterns
-    once one matches.
+    Such a pattern subsumes all more specific ones, so once it matches there is
+    nothing to gain from reporting the rest. The verbs are deliberately not part
+    of the test: a role granting named verbs on "*" resources still reaches every
+    resource type, and enumerating the ~65 patterns it technically matches makes
+    the Triggered By column unreadable while saying nothing extra.
     """
     return all(
-        rule.verbs == ["*"] and rule.resources == ["*"]
+        rule.resources == ["*"]
         and (rule.api_groups is None or rule.api_groups == ["*"])
         for rule in risky_role.rules
     )

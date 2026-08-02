@@ -148,6 +148,28 @@ items:
     resources: ["*"]
     verbs: ["*"]
 
+# Risk: named verbs, but on every resource of every API group - such a role can
+#       already read every Secret in the cluster
+# API Group: * | Resource: * | Scope: Cluster/Namespaced
+# Impact: Full read or write of the whole API surface
+# Reference: API groups/resources wildcard
+#
+# Must stay directly after risky-wildcard-all: both subsume every more specific
+# pattern, and the first one to match is the one reported. Without this entry a
+# role holding "*" resources matches ~65 patterns at once and its Triggered By
+# column becomes unreadable.
+
+- kind: Role
+  metadata:
+    namespace: default
+    name: risky-wildcard-resources
+    priority: CRITICAL
+  rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete",
+            "deletecollection", "impersonate", "escalate", "bind", "*"]
+
 # ---- Kubernetes: Identity / ServiceAccount tokens ----
 
 # Risk: Mint tokens for any service account via TokenRequest API (long-lived, traceless)
