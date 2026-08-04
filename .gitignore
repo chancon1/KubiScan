@@ -73,3 +73,6 @@ Thumbs.db
 
 # Local scratch copies of the risky-roles matrix
 tmp_*
+
+# Claude Code local settings and scratch worktrees
+.claude/

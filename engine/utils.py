@@ -2,6 +2,9 @@ import requests
 
 from engine.role import Role
 from engine.priority import Priority
+from engine.finding import Finding, RuleMatch
+from engine.scan_context import BoundBinding, ScanContext
+from engine.scoring import compute_priority, score_finding, highest_priority
 from static_risky_roles import STATIC_RISKY_ROLES
 from engine.role_binding import RoleBinding
 from kubernetes.stream import stream
@@ -19,50 +22,6 @@ from api.config import Config
 # region - Roles and ClusteRoles
 
 list_of_service_accounts = []
-def is_risky_resource_name_exist(source_rolename, source_resourcenames):
-    is_risky = False
-    for resource_name in source_resourcenames:
-        # prevent cycles.
-        if resource_name != source_rolename:
-            # TODO: Need to allow this check also for 'roles' resource_name, should consider namespace...
-            role = get_role_by_name_and_kind(resource_name, CLUSTER_ROLE_KIND)
-            if role is not None:
-                is_risky, priority, _ = is_risky_role(role)
-                if is_risky:
-                    break
-
-    return is_risky
-
-
-def format_api_group(api_group):
-    """Render an apiGroup for humans. The core group is an empty string in RBAC."""
-    return 'core' if api_group == '' else api_group
-
-
-def describe_rule_match(source_rule, risky_rule):
-    """Describe which permission of 'source_rule' made it match 'risky_rule'.
-
-    Produces e.g. "[core] configmaps: get,list,watch" so a report shows the
-    apiGroup the finding came from, not just the resource name. Wildcards on
-    the source side fall back to what the pattern was looking for.
-    """
-    groups = ','.join(format_api_group(g) for g in (source_rule.api_groups or ['?']))
-
-    source_resources = source_rule.resources or []
-    resources = [r for r in (risky_rule.resources or []) if r in source_resources] \
-        or list(risky_rule.resources or [])
-
-    source_verbs = source_rule.verbs or []
-    verbs = [v for v in (risky_rule.verbs or []) if v in source_verbs] or list(source_verbs)
-
-    return '[{0}] {1}: {2}'.format(groups, ','.join(resources), ','.join(verbs))
-
-
-def format_trigger_reason(pattern_name, match_details):
-    """Pattern name followed by the concrete rule(s) that triggered it."""
-    if not match_details:
-        return pattern_name
-    return '\n'.join([pattern_name] + ['  ' + detail for detail in match_details])
 
 
 def _non_resource_url_matches(source_url, risky_url):
@@ -107,55 +66,77 @@ def _resource_matches(source_resources, risky_resource):
                for resource in source_resources)
 
 
-def is_rule_contains_risky_rule(source_role_name, source_rule, risky_rule):
-    is_contains = False
-    is_bind_verb_found = False
-    is_role_resource_found = False
+def _matched_verbs(source_rule, risky_rule):
+    """Which of the pattern's verbs the source rule actually grants.
 
-    # Verb matching: OR logic - match if the source rule contains ANY of the risky verbs.
-    # Wildcard: if source role has verbs=["*"], it implicitly covers all verbs.
-    source_has_wildcard_verb = source_rule.verbs is not None and "*" in source_rule.verbs
-    for verb in risky_rule.verbs:
-        if source_has_wildcard_verb or (source_rule.verbs is not None and verb in source_rule.verbs):
-            is_contains = True
-            if verb.lower() == "bind":
-                is_bind_verb_found = True
+    A source rule holding "*" grants every verb the pattern asks about, so the
+    full pattern list is what got granted. This list is not cosmetic: scoring
+    reads it to decide whether a 'resourceNames' restriction is real, and
+    'resourceNames' does not constrain create/list/watch.
+    """
+    source_verbs = source_rule.verbs or []
+    source_has_wildcard = '*' in source_verbs
+    matched = []
+    for verb in risky_rule.verbs or []:
+        if verb == '*':
+            # A pattern listing "*" asks for unrestricted verb access itself,
+            # and only a source rule that also says "*" provides it.
+            if source_has_wildcard:
+                matched.append('*')
+            continue
+        if source_has_wildcard or verb in source_verbs:
+            matched.append(verb)
+    return matched
+
+
+def is_rule_contains_risky_rule(source_rule, risky_rule):
+    """Return a RuleMatch when 'source_rule' grants what 'risky_rule' describes.
+
+    Returns None when it does not, so callers get the matched verbs and the
+    source rule itself rather than a bare boolean.
+    """
+    # Verb matching: OR logic - match if the source rule contains ANY of the
+    # pattern's verbs. A source rule with verbs=["*"] covers all of them.
+    matched_verbs = _matched_verbs(source_rule, risky_rule)
+    if not matched_verbs:
+        return None
 
     # A non-resource URL pattern is matched against its own field; such rules
     # carry neither apiGroups nor resources, so the checks below do not apply.
     risky_non_resource_urls = getattr(risky_rule, 'non_resource_ur_ls', None)
     if risky_non_resource_urls:
-        return is_contains and do_non_resource_urls_contain(source_rule, risky_non_resource_urls)
+        if do_non_resource_urls_contain(source_rule, risky_non_resource_urls):
+            return RuleMatch(source_rule, risky_rule, matched_verbs, [])
+        return None
 
-    # apiGroups matching: at least one apiGroup from risky pattern must be
-    # covered by the source rule.  Wildcards on either side are honoured.
-    # If the risky pattern has no apiGroups (None) or uses ["*"], any source matches.
-    if is_contains and risky_rule.api_groups is not None and "*" not in risky_rule.api_groups:
-        source_api_groups = getattr(source_rule, 'api_groups', None) or []
-        if "*" not in source_api_groups:
+    # apiGroups matching: at least one apiGroup from the pattern must be covered
+    # by the source rule, and a source rule holding "*" covers all of them.
+    #
+    # A pattern asking for ["*"] is asking for group-unrestricted access
+    # specifically, so only a source rule that also says "*" satisfies it. That
+    # distinction matters: 'apiGroups: [constraints.gatekeeper.sh], resources:
+    # ["*"]' is every resource of one group, not every resource of the cluster,
+    # and treating the two alike let the wildcard patterns swallow it.
+    source_api_groups = getattr(source_rule, 'api_groups', None) or []
+    if risky_rule.api_groups is not None:
+        if "*" in risky_rule.api_groups:
+            if not getattr(risky_rule, 'any_api_group', False) \
+                    and "*" not in source_api_groups:
+                return None
+        elif "*" not in source_api_groups:
             if not any(ag in source_api_groups for ag in risky_rule.api_groups):
-                is_contains = False
+                return None
 
-    if is_contains and source_rule.resources is not None:
-        # Resource matching: ALL risky resources must be present in source rule.
-        # Wildcard: if source role has resources=["*"], it covers all resources.
-        for resource in risky_rule.resources or []:
-            if not _resource_matches(source_rule.resources, resource):
-                is_contains = False
-                break
-            if resource.lower() == "roles" or resource.lower() == "clusterroles":
-                is_role_resource_found = True
+    if source_rule.resources is None:
+        return None
 
-        if is_contains and risky_rule.resource_names is not None:
-            is_contains = False
-            if is_bind_verb_found and is_role_resource_found:
-                is_risky = is_risky_resource_name_exist(source_role_name, source_rule.resource_names)
-                if is_risky:
-                    is_contains = True
-    else:
-        is_contains = False
+    # Resource matching: ALL of the pattern's resources must be present in the
+    # source rule. A source rule with resources=["*"] covers all of them.
+    for resource in risky_rule.resources or []:
+        if not _resource_matches(source_rule.resources, resource):
+            return None
 
-    return is_contains
+    return RuleMatch(source_rule, risky_rule, matched_verbs, list(risky_rule.resources or []))
 
 
 def get_current_version(certificate_authority_file=None, client_certificate_file=None, client_key_file=None, host=None):
@@ -193,83 +174,69 @@ def get_current_version(certificate_authority_file=None, client_certificate_file
 
 
 
-def get_role_by_name_and_kind(name, kind, namespace=None):
-    requested_role = None
-    roles = get_roles_by_kind(kind)
-    for role in roles.items:
-        if role.metadata.name == name:
-            requested_role = role
-            break
-    return requested_role
+def are_rules_contain_other_rules(source_rules, target_rules):
+    """Return the RuleMatch list when every target rule is satisfied, else [].
 
-
-def are_rules_contain_other_rules(source_role_name, source_rules, target_rules):
-    """Return (is_contains, match_details).
-
-    'match_details' describes which source rule satisfied each target rule, so
-    callers can report the apiGroup/resource/verbs behind a finding.
+    A pattern holding more than one rule behaves as AND: all of its rules must
+    be matched, possibly by different rules of the source role. That is what
+    makes escalation-chain patterns ("create pods" AND "get secrets") work.
     """
-    matched_rules = 0
-    match_details = []
     if not (target_rules and source_rules):
-        return False, []
+        return []
+    matches = []
     for target_rule in target_rules:
         for source_rule in source_rules:
-            if is_rule_contains_risky_rule(source_role_name, source_rule, target_rule):
-                matched_rules += 1
-                match_details.append(describe_rule_match(source_rule, target_rule))
+            match = is_rule_contains_risky_rule(source_rule, target_rule)
+            if match is not None:
+                matches.append(match)
                 break
-        if matched_rules == len(target_rules):
-            return True, match_details
+        else:
+            return []
+    return matches
 
-    return False, []
 
+def evaluate_role(role, kind):
+    """Every pattern this role matches, unscored.
 
-def _is_wildcard_pattern(risky_role):
-    """Return True if the pattern covers every resource of every API group.
-
-    Such a pattern subsumes all more specific ones, so once it matches there is
-    nothing to gain from reporting the rest. The verbs are deliberately not part
-    of the test: a role granting named verbs on "*" resources still reaches every
-    resource type, and enumerating the ~65 patterns it technically matches makes
-    the Triggered By column unreadable while saying nothing extra.
+    Context-free by design: the same role yields the same findings no matter how
+    it is bound. Turning them into severities is scoring's job, and it needs the
+    whole cluster to do it.
     """
-    return all(
-        rule.resources == ["*"]
-        and (rule.api_groups is None or rule.api_groups == ["*"])
-        for rule in risky_role.rules
-    )
+    findings = []
+    for pattern in STATIC_RISKY_ROLES:
+        if not pattern.applies_to_kind(kind):
+            continue
+        matches = are_rules_contain_other_rules(role.rules, pattern.rules)
+        if not matches:
+            continue
+        finding = Finding(pattern, matches)
+        if pattern.subsumes_all:
+            # Nothing more specific can add information once this matched.
+            return [finding]
+        findings.append(finding)
+    return findings
 
 
-def is_risky_role(role):
-    trigger_reasons = []
-    highest_priority = Priority.NONE
-    for risky_role in STATIC_RISKY_ROLES:
-        is_contains, match_details = are_rules_contain_other_rules(role.metadata.name, role.rules,
-                                                                  risky_role.rules)
-        if is_contains:
-            reason = format_trigger_reason(risky_role.name, match_details)
-            if _is_wildcard_pattern(risky_role):
-                trigger_reasons = [reason]
-                highest_priority = risky_role.priority
-                break
-            trigger_reasons.append(reason)
-            if risky_role.priority.value > highest_priority.value:
-                highest_priority = risky_role.priority
-    if trigger_reasons:
-        return True, highest_priority, trigger_reasons
-    return False, Priority.NONE, []
+def _score_role(role, ctx, second_pass=False):
+    for finding in role.findings:
+        score_finding(finding, role, ctx, second_pass)
+    role.priority = highest_priority(role.findings)
 
 
-def find_risky_roles(roles, kind):
+def find_risky_roles(roles, kind, ctx=None):
+    """Build scored Role objects for whichever raw roles match a pattern."""
+    if ctx is None:
+        ctx = ScanContext.build()
     risky_roles = []
     for role in roles:
-        is_risky, priority, trigger_reasons = is_risky_role(role)
-        if is_risky:
-            risky_roles.append(
-                Role(role.metadata.name, priority, rules=role.rules, namespace=role.metadata.namespace, kind=kind,
-                     time=role.metadata.creation_timestamp, trigger_reasons=trigger_reasons))
-
+        findings = evaluate_role(role, kind)
+        if not findings:
+            continue
+        risky_role = Role(role.metadata.name, Priority.NONE, rules=role.rules,
+                          namespace=role.metadata.namespace, kind=kind,
+                          time=role.metadata.creation_timestamp, findings=findings)
+        _score_role(risky_role, ctx)
+        risky_roles.append(risky_role)
     return risky_roles
 
 
@@ -280,43 +247,67 @@ def get_roles_by_kind(kind):
         all_roles = Config.api_client.list_roles_for_all_namespaces()
     else:
         #all_roles = api_client.RbacAuthorizationV1Api.list_cluster_role()
-        #all_roles = api_client.api_temp.list_cluster_role() 
+        #all_roles = api_client.api_temp.list_cluster_role()
         all_roles = Config.api_client.list_cluster_role()
     return all_roles
 
 
-def get_risky_role_by_kind(kind):
+# Roles and ClusterRoles are always scanned together, because scoring one needs
+# to know about the other: "can create a pod" is only critical when a critical
+# service account stands next to it, whichever kind of role granted that account
+# its power. The result is memoised so that the several report switches of a
+# single run do not each re-read the whole cluster.
+_scan_cache = None
+
+
+def scan_roles_and_clusterroles(force=False):
+    """Full two-pass scan. Returns (risky_roles, context)."""
+    global _scan_cache
+    if _scan_cache is not None and not force:
+        return _scan_cache
+
+    ctx = ScanContext.build()
+
     risky_roles = []
+    for kind in (ROLE_KIND, CLUSTER_ROLE_KIND):
+        all_roles = get_roles_by_kind(kind)
+        if all_roles is not None:
+            risky_roles += find_risky_roles(all_roles.items, kind, ctx)
 
-    all_roles = get_roles_by_kind(kind)
+    # The first pass scored everything except the one modifier that has to know
+    # which service accounts are already critical. Build that map from its
+    # result - it never consults the map itself, so there is no circularity -
+    # and let the affected findings settle.
+    ctx.build_privileged_sa_map(risky_roles)
+    for risky_role in risky_roles:
+        _score_role(risky_role, ctx, second_pass=True)
+        risky_role.bound_service_accounts = describe_bound_subjects(risky_role, ctx)
 
-    if all_roles is not None:
-        risky_roles = find_risky_roles(all_roles.items, kind)
+    _scan_cache = (risky_roles, ctx)
+    return _scan_cache
 
-    return risky_roles
+
+def reset_scan_cache():
+    global _scan_cache
+    _scan_cache = None
 
 
 def get_risky_roles_and_clusterroles():
-    risky_roles = get_risky_roles()
-    risky_clusterroles = get_risky_clusterroles()
-
-    # return risky_roles, risky_clusterroles
-    all_risky_roles = risky_roles + risky_clusterroles
-    return all_risky_roles
+    return scan_roles_and_clusterroles()[0]
 
 
 def get_risky_roles():
-    return get_risky_role_by_kind('Role')
+    return [role for role in get_risky_roles_and_clusterroles() if role.kind == ROLE_KIND]
 
 
 def get_risky_clusterroles():
-    return get_risky_role_by_kind('ClusterRole')
+    return [role for role in get_risky_roles_and_clusterroles() if role.kind == CLUSTER_ROLE_KIND]
 
 
 # endregion - Roles and ClusteRoles
 
 
-def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_crb):
+def describe_bound_subjects(role, ctx):
     """Return list of strings describing the subjects bound to the given role.
 
     Users and Groups are reported alongside service accounts: a risky role
@@ -330,51 +321,24 @@ def get_service_accounts_for_role(role_name, role_kind, namespace, all_rb, all_c
     Works with both live-cluster and static-file modes.
     """
     result = []
-    for rb in all_rb.items:
-        if rb.role_ref.name == role_name and rb.role_ref.kind == role_kind:
-            if role_kind == ROLE_KIND and rb.metadata.namespace != namespace:
-                continue
-            rb_namespace = rb.metadata.namespace or 'Unknown'
-            for subject in (rb.subjects or []):
-                if subject.kind == SERVICEACCOUNT_KIND:
-                    sa_namespace = subject.namespace or rb_namespace
-                    result.append(
-                        "{sa}@{sa_ns} [SA NS] (via RoleBinding: {rb_ns} [RoleBinding NS]/{rb} [RoleBinding name])".format(
-                            sa=subject.name,
-                            sa_ns=sa_namespace,
-                            rb_ns=rb_namespace,
-                            rb=rb.metadata.name
-                        )
-                    )
-                else:
-                    result.append(
-                        "{name} [{kind}] (via RoleBinding: {rb_ns} [RoleBinding NS]/{rb} [RoleBinding name])".format(
-                            name=subject.name,
-                            kind=subject.kind,
-                            rb_ns=rb_namespace,
-                            rb=rb.metadata.name
-                        )
-                    )
-    if role_kind == CLUSTER_ROLE_KIND:
-        for crb in all_crb:
-            if crb.role_ref.name == role_name and crb.role_ref.kind == role_kind:
-                for subject in (crb.subjects or []):
-                    if subject.kind == SERVICEACCOUNT_KIND:
-                        result.append(
-                            "{sa}@{ns} [SA NS] (via ClusterRoleBinding: {crb} [ClusterRoleBinding name])".format(
-                                sa=subject.name,
-                                ns=subject.namespace,
-                                crb=crb.metadata.name
-                            )
-                        )
-                    else:
-                        result.append(
-                            "{name} [{kind}] (via ClusterRoleBinding: {crb} [ClusterRoleBinding name])".format(
-                                name=subject.name,
-                                kind=subject.kind,
-                                crb=crb.metadata.name
-                            )
-                        )
+    for binding in ctx.bindings_for(role):
+        if binding.is_cluster_wide:
+            via = "ClusterRoleBinding: {name} [ClusterRoleBinding name]".format(name=binding.name)
+            default_namespace = None
+        else:
+            via = "RoleBinding: {ns} [RoleBinding NS]/{name} [RoleBinding name]".format(
+                ns=binding.namespace or 'Unknown', name=binding.name)
+            default_namespace = binding.namespace or 'Unknown'
+
+        for subject in binding.subjects or []:
+            if subject.kind == SERVICEACCOUNT_KIND:
+                result.append("{sa}@{ns} [SA NS] (via {via})".format(
+                    sa=subject.name,
+                    ns=subject.namespace or default_namespace,
+                    via=via))
+            else:
+                result.append("{name} [{kind}] (via {via})".format(
+                    name=subject.name, kind=subject.kind, via=via))
     return result
 
 # region - RoleBindings and ClusterRoleBindings
@@ -406,13 +370,35 @@ def is_risky_rolebinding(risky_roles, rolebinding):
     return True, risky_role.priority
 
 
-def find_risky_rolebindings_or_clusterrolebindings(risky_roles, rolebindings, kind):
+def priority_for_binding(risky_role, rolebinding, kind, ctx):
+    """Score a role's findings for the scope of one specific binding.
+
+    The role-level priority is the worst case across every binding it has. A
+    single binding is usually narrower than that: a ClusterRole granting
+    'create clusterrolebindings' is critical when a ClusterRoleBinding hands it
+    out, and inert when only a namespaced RoleBinding does.
+    """
+    scoped = ctx.scoped_to(BoundBinding(kind, rolebinding.metadata.name,
+                                        rolebinding.metadata.namespace,
+                                        rolebinding.subjects))
+    highest = Priority.NONE
+    for finding in risky_role.findings:
+        priority = compute_priority(finding, risky_role, scoped, second_pass=True)
+        if priority.value > highest.value:
+            highest = priority
+    return highest
+
+
+def find_risky_rolebindings_or_clusterrolebindings(risky_roles, rolebindings, kind, ctx=None):
+    if ctx is None:
+        ctx = scan_roles_and_clusterroles()[1]
     risky_rolebindings = []
     for rolebinding in rolebindings:
         risky_role = get_role_referenced_by_binding(risky_roles, rolebinding)
         if risky_role is not None:
             risky_rolebindings.append(RoleBinding(rolebinding.metadata.name,
-                                                  risky_role.priority,
+                                                  priority_for_binding(risky_role, rolebinding,
+                                                                       kind, ctx),
                                                   namespace=rolebinding.metadata.namespace,
                                                   kind=kind, subjects=rolebinding.subjects,
                                                   time=rolebinding.metadata.creation_timestamp,
@@ -432,35 +418,35 @@ def get_rolebinding_by_kind_all_namespaces(kind):
 
 
 def get_all_risky_rolebinding():
-    all_risky_roles = get_risky_roles_and_clusterroles()
+    all_risky_roles, ctx = scan_roles_and_clusterroles()
 
-    risky_rolebindings = get_risky_rolebindings(all_risky_roles)
-    risky_clusterrolebindings = get_risky_clusterrolebindings(all_risky_roles)
+    risky_rolebindings = get_risky_rolebindings(all_risky_roles, ctx)
+    risky_clusterrolebindings = get_risky_clusterrolebindings(all_risky_roles, ctx)
 
     risky_rolebindings_and_clusterrolebindings = risky_clusterrolebindings + risky_rolebindings
     return risky_rolebindings_and_clusterrolebindings
 
 
-def get_risky_rolebindings(all_risky_roles=None):
-    if all_risky_roles is None:
-        all_risky_roles = get_risky_roles_and_clusterroles()
+def get_risky_rolebindings(all_risky_roles=None, ctx=None):
+    if all_risky_roles is None or ctx is None:
+        all_risky_roles, ctx = scan_roles_and_clusterroles()
     all_rolebindings = get_rolebinding_by_kind_all_namespaces(ROLE_BINDING_KIND)
     risky_rolebindings = find_risky_rolebindings_or_clusterrolebindings(all_risky_roles, all_rolebindings.items,
-                                                                        "RoleBinding")
+                                                                        ROLE_BINDING_KIND, ctx)
 
     return risky_rolebindings
 
 
-def get_risky_clusterrolebindings(all_risky_roles=None):
-    if all_risky_roles is None:
-        all_risky_roles = get_risky_roles_and_clusterroles()
+def get_risky_clusterrolebindings(all_risky_roles=None, ctx=None):
+    if all_risky_roles is None or ctx is None:
+        all_risky_roles, ctx = scan_roles_and_clusterroles()
     # Cluster doesn't work.
     # https://github.com/kubernetes-client/python/issues/577 - when it will be solve, can remove the comments
     # all_clusterrolebindings = api_client.RbacAuthorizationV1Api.list_cluster_role_binding()
     all_clusterrolebindings = Config.api_client.list_cluster_role_binding()
     # risky_clusterrolebindings = find_risky_rolebindings(all_risky_roles, all_clusterrolebindings.items, "ClusterRoleBinding")
     risky_clusterrolebindings = find_risky_rolebindings_or_clusterrolebindings(all_risky_roles, all_clusterrolebindings,
-                                                                               "ClusterRoleBinding")
+                                                                               CLUSTER_ROLE_BINDING_KIND, ctx)
     return risky_clusterrolebindings
 
 

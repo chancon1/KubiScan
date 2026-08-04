@@ -4,6 +4,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 
+## [Unreleased]
+
+Context-aware risk matrix. A finding's severity is now decided by where the
+permission was actually granted, not by a constant attached to the pattern.
+
+### Added
+- Context scoring engine (`engine/scoring.py`). Seven modifiers adjust a
+  pattern's base priority and are applied in a fixed order, clamped to
+  LOW..CRITICAL: `clusterWide`, `namespacedBindingOnly`, `sensitiveNamespace`,
+  `boundToEveryone`, `privilegedSaReachable`, `resourceNamesRestricted`,
+  `unbound`. A match never decays to NONE - context can make a finding less
+  urgent, but the permission is still there.
+- `engine/scan_context.py` - binding index built once per scan, sensitive
+  namespace list, privileged service-account map, and `SingleBindingContext`
+  for scoring one binding in isolation.
+- Two-pass scan (`scan_roles_and_clusterroles`). The first pass scores
+  everything except `privilegedSaReachable`; the map of already-critical
+  service accounts is built from its result, then the second pass settles the
+  affected findings. The map is never consulted while it is being built.
+- `engine/finding.py` - `Finding`, `RuleMatch` and `AppliedModifier`. A report
+  now shows the score arithmetic (`HIGH -> CRITICAL`), the matched rules with
+  their apiGroup, and every modifier with its delta and reason.
+- `engine/risky_pattern.py` - a matrix entry is a pattern, not a `Role`.
+- `sensitive_namespaces.yaml` plus `--sensitive-namespaces` and
+  `--sensitive-namespaces-add` to replace or extend the shipped list.
+- `profiles:` block in `risky_roles.yaml`; patterns gained `scope`, `appliesTo`,
+  `profile`, `modifiers`, `category` and `matchesAnyApiGroup`.
+- Matrix grew from 80 to 170 patterns across 10 categories, 76 of them
+  cluster-scoped.
+- Test suite under `tests/` (`python tests/run_all.py`, no cluster needed).
+  `tests/fixtures/detected_permissions.txt` baselines all 556 permissions the
+  matrix can detect, so losing one shows up as a deleted line rather than as
+  silence.
+
+### Changed
+- RoleBindings and ClusterRoleBindings are scored per binding rather than
+  inheriting the role's worst case. A ClusterRole granting
+  `create clusterrolebindings` is critical behind a ClusterRoleBinding and
+  inert behind a namespaced RoleBinding.
+- Bound subjects are read from the scan context instead of being recomputed in
+  each print function; removed four duplicated blocks from `KubiScan.py`.
+- The scan is memoised, so the several report switches of one run no longer
+  each re-read the whole cluster.
+- `is_rule_contains_risky_rule` returns a `RuleMatch` carrying the source rule
+  and the matched verbs instead of a bool - scoring needs the verbs to tell
+  whether a `resourceNames` restriction narrows anything.
+
+### Fixed
+- `apiGroups: ["*"]` in a pattern now means group-unrestricted access
+  specifically, satisfied only by a source rule that also says `"*"`. Total
+  control of one API group is expressed with `matchesAnyApiGroup: true`. The
+  two were previously alike, which let the wildcard patterns swallow
+  `apiGroups: [constraints.gatekeeper.sh], resources: ["*"]`.
+- A pattern verb of `"*"` likewise requires `"*"` on the source rule.
+- Patterns holding several rules are a strict AND. The old match counter could
+  report success before every rule had been satisfied, which is what the
+  escalation-chain patterns depend on.
+- Cluster-scoped patterns are no longer evaluated against namespaced Roles. A
+  Role granting `get nodes/proxy` grants nothing and is no longer reported.
+- Dropped the `resourceNames` + `bind` recursion, which re-read roles from the
+  cluster in the middle of rule matching.
+- A role holding a full wildcard collapses into one finding instead of matching
+  the whole matrix.
+
 ## [v1.6] - 2023-01-27
 - Replaced Added support to match case match case with if else to support Python versions below 3.10 (#69 by @kamal2222ahmed)
 - Failed chmod when not specifying AWS info (#66 & #67 by @elreydetoda)

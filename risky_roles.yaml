@@ -1,1292 +1,2133 @@
-
 ######################### REGION - Risky permissions combinations #########################
+#
+# HOW A PRIORITY IS DECIDED
+#
+# 'priority' below is a BASE score: what the permission is worth in the plain
+# case of a namespaced Role, bound, in an unremarkable namespace. The scanner
+# then applies the context rules named in 'profile'/'modifiers' and clamps the
+# result to LOW..CRITICAL. A match never decays to nothing - context can make a
+# finding less urgent, but the permission is still there.
+#
+# This is why "create pods" is not flat CRITICAL any more. In one team namespace
+# it is HIGH; granted cluster-wide, or next to a service account that is already
+# critical, it becomes CRITICAL; on a role nobody is bound to, it is MEDIUM.
+#
+# PATTERN FIELDS
+#
+#   name        identifier shown in the report
+#   priority    base score - CRITICAL / HIGH / MEDIUM / LOW
+#   scope       'namespaced' (default) or 'cluster'. A cluster-scoped resource is
+#               never granted by a namespaced Role, so patterns marked 'cluster'
+#               are not even evaluated against one. This removes a whole class of
+#               false positives: a Role granting "get nodes/proxy" grants nothing.
+#   appliesTo   [Role, ClusterRole] unless narrowed. Usually left implicit -
+#               'scope' already excludes Roles where that would be wrong.
+#   profile     named set of context modifiers, see below
+#   modifiers   inline overrides merged on top of the profile
+#   category    grouping for reports and filtering
+#
+# MODIFIERS
+#
+#   clusterWide             ClusterRole reached by a ClusterRoleBinding: the
+#                           grant covers every namespace.
+#   namespacedBindingOnly   ClusterRole that only RoleBindings reference. Binding
+#                           a ClusterRole with a RoleBinding grants its namespaced
+#                           permissions inside that one namespace and nothing
+#                           else, so its cluster-scoped rules never take effect.
+#   sensitiveNamespace      Grant lands in a namespace from
+#                           sensitive_namespaces.yaml. Not applied to cluster-wide
+#                           grants - clusterWide already accounts for that.
+#   boundToEveryone         A binding hands the role to system:authenticated or
+#                           system:unauthenticated, so every user of the cluster
+#                           holds it.
+#   privilegedSaReachable   The permission can run a workload in a namespace that
+#                           hosts an already-critical service account. Creating a
+#                           pod lets you name any service account of that
+#                           namespace as its identity, so the permission is worth
+#                           as much as the best identity standing next to it.
+#   resourceNamesRestricted Every matched rule is pinned to named objects, on
+#                           verbs that RBAC actually narrows by name. 'create'
+#                           and collection requests ('list', 'watch',
+#                           'deletecollection') are never narrowed, so mixing
+#                           those in earns no discount. Everything else is -
+#                           including 'use', 'bind', 'escalate', 'impersonate'
+#                           and 'approve', which exist to be pinned by name.
+#   unbound                 No RoleBinding or ClusterRoleBinding references the
+#                           role. A latent risk, not an active one.
+#
+# MATCHING
+#
+# Verb matching is OR-based: a role matches when it holds ANY of the listed verbs
+# on the listed resource. A source rule holding "*" satisfies every named verb.
+# A pattern listing "*" asks for unrestricted verb access specifically, and only
+# a source rule that also says "*" provides it - which is why the named patterns
+# below no longer carry a redundant "*".
+#
+# Pattern rules are AND-ed: a pattern with two rules matches only when both are
+# satisfied, possibly by different rules of the role. That is what makes the
+# escalation-chain patterns at the end of this file work.
+#
+# apiGroups must name the group the resource really lives in - "" for the core
+# group. Never use "*" as a shorthand for "any group": an unrelated CRD of the
+# same name would then match a Kubernetes-native pattern. A pattern asking for
+# ["*"] means group-unrestricted access specifically, and only a role that also
+# says "*" satisfies it - which is what the two wildcard patterns below want.
+# 'apiGroups: [x], resources: ["*"]' stays every resource of group x alone.
 
-# Source: rbac_security_matrix_k8s_kyverno_updated.xlsx
-# Generated from security matrix covering: Kubernetes, Kyverno, Policy WG, Cilium, Calico
-#
-# The order is important!
-# Patterns are ordered by priority (CRITICAL first, then HIGH, MEDIUM, LOW).
-# When a fully-wildcard pattern matches (verbs/resources/apiGroups all "*"),
-# the scanner stops checking further patterns, as wildcard semantically
-# subsumes all more specific rules.
-#
-# Verb matching is OR-based: a role matches a pattern if it contains ANY of the listed
-# verbs on the listed resource. Single-verb entries detect specific dangerous permissions.
-# The wildcard entry ("*") catches roles with unrestricted verb access.
-#
-# apiGroups must name the group the resource really lives in - "" for the core group.
-# Using "*" here disables the group check entirely, which makes an unrelated CRD of the
-# same name (e.g. "secrets" in a vendor group) match a Kubernetes-native pattern.
+profiles:
 
-######################### REGION - CRITICAL #########################
+  # Namespaced resource whose abuse escalates privileges or exposes credentials.
+  namespaced-escalation:
+    clusterWide: 1
+    sensitiveNamespace: 1
+    boundToEveryone: 1
+    resourceNamesRestricted: -1
+    unbound: -1
+
+  # As above, and the permission lets you run a workload under any identity of
+  # the namespace it lands in.
+  workload-execution:
+    clusterWide: 1
+    sensitiveNamespace: 1
+    boundToEveryone: 1
+    privilegedSaReachable: 1
+    resourceNamesRestricted: -1
+    unbound: -1
+
+  # Cluster-scoped resource: only a ClusterRole behind a ClusterRoleBinding
+  # actually grants it.
+  cluster-scoped:
+    clusterWide: 1
+    namespacedBindingOnly: -1
+    boundToEveryone: 1
+    resourceNamesRestricted: -1
+    unbound: -1
+
+  # Already at the ceiling of the scale; only downgrades can apply.
+  unconditional:
+    boundToEveryone: 1
+    unbound: -1
+
+  # Reconnaissance. Every authenticated user already holds most of these through
+  # the built-in system:basic-user ClusterRole, so 'clusterWide' would fire on
+  # every cluster there is and quietly undo the point of scoring them LOW.
+  # Nothing here should ever climb.
+  recon:
+    unbound: -1
 
 items:
 
-# ---- Kubernetes: RBAC / Access governance ----
+######################### REGION - RBAC / Access governance #########################
 
-# Risk: Defining or modifying cluster-wide RBAC roles; bind/escalate bypass built-in protections
-# API Group: rbac.authorization.k8s.io | Resource: clusterroles | Scope: Cluster
+# Risk: Defining or modifying cluster-wide RBAC roles
 # Impact: Privilege escalation
 # Reference: https://kubernetes.io/docs/concepts/security/rbac-good-practices/
 
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-clusterroles
+- metadata:
+    name: risky-clusterroles-write
     priority: CRITICAL
+    scope: cluster
+    profile: cluster-scoped
+    category: privilege-escalation
   rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["clusterroles"]
-    verbs: ["create", "update", "patch", "delete", "bind", "escalate", "*"]
+    verbs: ["create", "update", "patch"]
 
-# Risk: Defining or modifying namespaced RBAC roles; bind/escalate enable privilege escalation
-# API Group: rbac.authorization.k8s.io | Resource: roles | Scope: Namespaced
+# Risk: 'bind' and 'escalate' exist to bypass the privilege-escalation guard that
+#       normally stops you granting permissions you do not hold yourself
 # Impact: Privilege escalation
-# Reference: https://kubernetes.io/docs/concepts/security/rbac-good-practices/
 
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-roles
+- metadata:
+    name: risky-clusterroles-bind-escalate
     priority: CRITICAL
+    scope: cluster
+    profile: cluster-scoped
+    category: privilege-escalation
+  rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["bind", "escalate"]
+
+- metadata:
+    name: risky-clusterroles-destroy
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: availability
+  rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["delete", "deletecollection"]
+
+# Risk: Defining or modifying namespaced RBAC roles
+# Impact: Privilege escalation
+
+- metadata:
+    name: risky-roles-write
+    priority: CRITICAL
+    profile: namespaced-escalation
+    category: privilege-escalation
   rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles"]
-    verbs: ["create", "update", "patch", "delete", "bind", "escalate", "*"]
+    verbs: ["create", "update", "patch"]
+
+- metadata:
+    name: risky-roles-bind-escalate
+    priority: CRITICAL
+    profile: namespaced-escalation
+    category: privilege-escalation
+  rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles"]
+    verbs: ["bind", "escalate"]
+
+- metadata:
+    name: risky-roles-destroy
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles"]
+    verbs: ["delete", "deletecollection"]
 
 # Risk: Granting roles cluster-wide; create/patch can instantly grant high privileges
-# API Group: rbac.authorization.k8s.io | Resource: clusterrolebindings | Scope: Cluster
-# Impact: Privilege escalation / Broad access
+# Impact: Privilege escalation
 # Reference: https://kubernetes.io/docs/reference/access-authn-authz/rbac/
 
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-clusterrolebindings
+- metadata:
+    name: risky-clusterrolebindings-write
     priority: CRITICAL
+    scope: cluster
+    profile: cluster-scoped
+    category: privilege-escalation
   rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["clusterrolebindings"]
-    verbs: ["create", "update", "patch", "delete", "*"]
+    verbs: ["create", "update", "patch"]
 
-# Risk: Granting roles within namespaces; patching subjects can add privileged accounts
-# API Group: rbac.authorization.k8s.io | Resource: rolebindings | Scope: Namespaced
+- metadata:
+    name: risky-clusterrolebindings-destroy
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: availability
+  rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings"]
+    verbs: ["delete", "deletecollection"]
+
+# Risk: Granting roles within a namespace; patching subjects adds privileged accounts
 # Impact: Privilege escalation
-# Reference: https://kubernetes.io/docs/reference/access-authn-authz/rbac/
 
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-rolebindings
+- metadata:
+    name: risky-rolebindings-write
     priority: CRITICAL
+    profile: namespaced-escalation
+    category: privilege-escalation
   rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["rolebindings"]
-    verbs: ["create", "update", "patch", "delete", "*"]
+    verbs: ["create", "update", "patch"]
 
-# ---- Kubernetes: Identity / Impersonation ----
+- metadata:
+    name: risky-rolebindings-destroy
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["delete", "deletecollection"]
 
-# Risk: Impersonate any user identity, gaining that identity's permissions
-# Resource: users | Scope: N/A
-# Impact: Privilege escalation
+######################### REGION - Identity / Impersonation #########################
+
+# Impersonation is authorized against cluster-scoped pseudo-resources, so a
+# namespaced Role granting it grants nothing.
 # Reference: https://kubernetes.io/docs/reference/access-authn-authz/user-impersonation/
 
-- kind: Role
-  metadata:
-    namespace: default
+- metadata:
     name: risky-impersonate-users
     priority: CRITICAL
+    scope: cluster
+    profile: cluster-scoped
+    category: privilege-escalation
   rules:
   - apiGroups: [""]
     resources: ["users"]
     verbs: ["impersonate"]
 
-# Risk: Impersonate privileged groups (e.g., system:masters), gaining aggregated permissions
-# Resource: groups | Scope: N/A
-# Impact: Privilege escalation
-# Reference: https://kubernetes.io/docs/reference/access-authn-authz/user-impersonation/
-
-- kind: Role
-  metadata:
-    namespace: default
+# Risk: Impersonating a privileged group such as system:masters
+- metadata:
     name: risky-impersonate-groups
     priority: CRITICAL
+    scope: cluster
+    profile: cluster-scoped
+    category: privilege-escalation
   rules:
   - apiGroups: [""]
     resources: ["groups"]
     verbs: ["impersonate"]
 
-# Risk: Impersonate service accounts, enabling workload identity takeover
-# Resource: serviceaccounts | Scope: Namespaced
-# Impact: Privilege escalation
-# Reference: https://kubernetes.io/docs/reference/access-authn-authz/user-impersonation/
-
-- kind: Role
-  metadata:
-    namespace: default
+# ServiceAccounts, unlike users and groups, really are namespaced.
+- metadata:
     name: risky-impersonate-serviceaccounts
     priority: CRITICAL
+    profile: namespaced-escalation
+    category: privilege-escalation
   rules:
   - apiGroups: [""]
     resources: ["serviceaccounts"]
     verbs: ["impersonate"]
 
-# ---- Kubernetes: RBAC / Wildcard access ----
+# The API always spells these as a subresource ("userextras/scopes"), never as a
+# bare "userextras", so the pattern has to cover the whole subtree.
+- metadata:
+    name: risky-impersonate-userextras
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: privilege-escalation
+  rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["userextras/*"]
+    verbs: ["impersonate"]
+
+######################### REGION - Wildcard access #########################
 
 # Risk: Full unrestricted access across the entire Kubernetes API surface
-# API Group: * | Resource: * | Scope: Cluster/Namespaced
-# Impact: Full administrative control / Cluster compromise
-# Reference: API groups/resources/verbs wildcard
+# Impact: Cluster compromise
 
-- kind: Role
-  metadata:
-    namespace: default
+- metadata:
     name: risky-wildcard-all
     priority: CRITICAL
+    profile: unconditional
+    category: privilege-escalation
   rules:
   - apiGroups: ["*"]
     resources: ["*"]
     verbs: ["*"]
 
 # Risk: named verbs, but on every resource of every API group - such a role can
-#       already read every Secret in the cluster
-# API Group: * | Resource: * | Scope: Cluster/Namespaced
-# Impact: Full read or write of the whole API surface
-# Reference: API groups/resources wildcard
+#       already read every Secret in the cluster.
 #
 # Must stay directly after risky-wildcard-all: both subsume every more specific
 # pattern, and the first one to match is the one reported. Without this entry a
-# role holding "*" resources matches ~65 patterns at once and its Triggered By
-# column becomes unreadable.
+# role holding "*" resources matches most of this file at once and its report
+# entry becomes unreadable.
 
-- kind: Role
-  metadata:
-    namespace: default
+- metadata:
     name: risky-wildcard-resources
     priority: CRITICAL
+    profile: unconditional
+    category: privilege-escalation
   rules:
   - apiGroups: ["*"]
     resources: ["*"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete",
             "deletecollection", "impersonate", "escalate", "bind", "*"]
 
-# ---- Kubernetes: Identity / ServiceAccount tokens ----
+# Risk: every resource of one API group - including every CRD a vendor ships
+#       there, present and future
+# Impact: Total control of one product's API surface
+#
+# 'matchesAnyApiGroup' is what makes this work: the two patterns above want a
+# role that is itself group-unrestricted, while this one matches whichever
+# single group the role happens to name. Without it, 'apiGroups: [vendor.io],
+# resources: ["*"]' matched nothing at all - the group is not "*", so the
+# wildcard patterns did not apply, and no named pattern knows that vendor.
+#
+# Deliberately not treated as subsuming: full control of one group is a real
+# finding, but it says nothing about any other group, so more specific patterns
+# for that same group are still worth reporting alongside it.
 
-# Risk: Mint tokens for any service account via TokenRequest API (long-lived, traceless)
-# Resource: serviceaccounts/token | Scope: Namespaced
-# Impact: Token minting / Impersonation risk
+- metadata:
+    name: risky-single-group-wildcard
+    priority: HIGH
+    matchesAnyApiGroup: true
+    profile: namespaced-escalation
+    category: privilege-escalation
+  rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete",
+            "deletecollection", "impersonate", "escalate", "bind", "use", "*"]
 
-- kind: Role
-  metadata:
-    namespace: default
+######################### REGION - Credentials #########################
+
+# Risk: Mint tokens for any service account via the TokenRequest API
+# Impact: Token minting / Impersonation
+
+- metadata:
     name: risky-serviceaccount-token
     priority: CRITICAL
+    profile: namespaced-escalation
+    category: credential-access
   rules:
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
     verbs: ["create"]
 
-# ---- Kubernetes: Secrets / Credentials ----
-
-# Risk: Secrets store passwords, tokens, keys; reads exfiltrate, writes replace credentials
-# Resource: secrets | Scope: Namespaced
-# Impact: Secret exposure / Credential theft
+# Risk: Secrets store passwords, tokens and keys
 # Reference: https://kubernetes.io/docs/concepts/configuration/secret/
 
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-secrets
-    priority: CRITICAL
+- metadata:
+    name: risky-secrets-read
+    priority: HIGH
+    profile: namespaced-escalation
+    category: credential-access
   rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "*"]
+    verbs: ["get", "list", "watch"]
 
-# ---- Kubernetes: Workload execution ----
+- metadata:
+    name: risky-secrets-write
+    priority: HIGH
+    profile: namespaced-escalation
+    category: credential-access
+  rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "update", "patch"]
 
-# Risk: Pod creation/modification can mount secrets, set any SA, use privileged securityContext
-# Resource: pods | Scope: Namespaced
-# Impact: Privilege escalation / Code execution
+- metadata:
+    name: risky-secrets-destroy
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["delete", "deletecollection"]
+
+# Risk: ServiceAccounts provide pod identities
+- metadata:
+    name: risky-write-serviceaccounts
+    priority: HIGH
+    profile: namespaced-escalation
+    category: privilege-escalation
+  rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["create", "update", "patch"]
+
+# Deleting a service account breaks whatever authenticates as it.
+- metadata:
+    name: risky-serviceaccounts-destroy
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["delete", "deletecollection"]
+
+######################### REGION - Workload execution #########################
+
+# Risk: Pod creation can mount any secret, adopt any service account of the
+#       namespace, and request a privileged securityContext
 # Reference: https://kubernetes.io/docs/concepts/security/security-checklist/
 
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-pods
-    priority: CRITICAL
+- metadata:
+    name: risky-pods-create
+    priority: HIGH
+    profile: workload-execution
+    category: workload-execution
   rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["create", "update", "patch", "delete", "*"]
+    verbs: ["create"]
+
+# A pod's image is mutable, so patching one is code execution in an identity you
+# did not have to create.
+- metadata:
+    name: risky-pods-update
+    priority: HIGH
+    profile: workload-execution
+    category: workload-execution
+  rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["update", "patch"]
+
+- metadata:
+    name: risky-pods-destroy
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete", "deletecollection"]
 
 # Risk: Direct arbitrary command execution inside running pods
-# Resource: pods/exec | Scope: Namespaced
-# Impact: Interactive access / Data exfiltration
-# Reference: https://kubernetes.io/docs/reference/using-api/api-concepts/
-
-- kind: Role
-  metadata:
-    namespace: default
+- metadata:
     name: risky-pods-exec
-    priority: CRITICAL
+    priority: HIGH
+    profile: namespaced-escalation
+    category: workload-execution
   rules:
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create"]
 
-# ---- Kubernetes: Admission / Policy enforcement ----
-
-# Risk: Validating webhooks can block operations or exfiltrate data; tampering bypasses policy enforcement
-# API Group: admissionregistration.k8s.io | Resource: validatingwebhookconfigurations | Scope: Cluster
-# Impact: Policy bypass / Control-plane integrity
-# Reference: https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-validatingwebhookconfigurations
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["admissionregistration.k8s.io"]
-    resources: ["validatingwebhookconfigurations"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: Mutating webhooks can silently modify any object; tampering enables hidden privilege changes
-# API Group: admissionregistration.k8s.io | Resource: mutatingwebhookconfigurations | Scope: Cluster
-# Impact: Policy bypass / Control-plane integrity
-# Reference: https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-mutatingwebhookconfigurations
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["admissionregistration.k8s.io"]
-    resources: ["mutatingwebhookconfigurations"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Kubernetes: Identity / Certificates ----
-
-# Risk: Approving CSRs can issue client certificates for any identity
-# API Group: certificates.k8s.io | Resource: certificatesigningrequests/approval | Scope: Cluster
-# Impact: Credential issuance
-# Reference: https://kubernetes.io/docs/reference/access-authn-authz/certificate-signing-requests/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-csr-approval
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["certificates.k8s.io"]
-    resources: ["certificatesigningrequests/approval"]
-    verbs: ["approve", "update"]
-
-# ---- Kyverno: kyverno.io CRDs ----
-
-# Risk: Cluster-wide policies validate/mutate/generate/verifyImages; changing them alters enforcement
-# API Group: kyverno.io | Resource: clusterpolicies | Scope: Cluster
-# Impact: Policy bypass / Mutation / Generation
-# Reference: https://kyverno.io/docs/introduction/how-kyverno-works/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-clusterpolicies
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["kyverno.io"]
-    resources: ["clusterpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: PolicyException allows bypassing specific policy/rule combinations
-# API Group: kyverno.io | Resource: policyexceptions | Scope: Namespaced
-# Impact: Policy bypass
-# Reference: https://kyverno.io/docs/guides/exceptions/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-policyexceptions
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["kyverno.io"]
-    resources: ["policyexceptions"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Kyverno: policies.kyverno.io CRDs ----
-
-# Risk: ValidatingPolicy validates K8s resources/JSON; tampering bypasses admission enforcement
-# API Group: policies.kyverno.io | Resource: validatingpolicies | Scope: Cluster
-# Impact: Admission enforcement bypass
-# Reference: https://kyverno.io/docs/policy-types/overview/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-validatingpolicies
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["policies.kyverno.io"]
-    resources: ["validatingpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: MutatingPolicy can mutate new or existing resources; tampering enables stealth changes
-# API Group: policies.kyverno.io | Resource: mutatingpolicies | Scope: Cluster
-# Impact: Stealth mutation / Privilege escalation
-# Reference: https://kyverno.io/docs/policy-types/overview/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-mutatingpolicies
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["policies.kyverno.io"]
-    resources: ["mutatingpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: CEL PolicyException enables bypass of CEL-based policies
-# API Group: policies.kyverno.io | Resource: policyexceptions | Scope: Namespaced
-# Impact: Policy bypass
-# Reference: https://kyverno.io/docs/policy-types/overview/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-cel-policyexceptions
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["policies.kyverno.io"]
-    resources: ["policyexceptions"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Cilium: Network policy ----
-
-# Risk: CiliumNetworkPolicy extends K8s NetworkPolicy; changes can open ingress/egress, weaken isolation
-# API Group: cilium.io | Resource: ciliumnetworkpolicies | Scope: Namespaced
-# Impact: Segmentation bypass / Lateral movement
-# Reference: https://docs.cilium.io/en/stable/network/kubernetes/policy.html
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-cil-networkpolicies
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["cilium.io"]
-    resources: ["ciliumnetworkpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: CiliumClusterwideNetworkPolicy applies cluster-wide; tampering weakens global segmentation
-# API Group: cilium.io | Resource: ciliumclusterwidenetworkpolicies | Scope: Cluster
-# Impact: Cluster-wide segmentation bypass / Node traffic exposure
-# Reference: https://docs.cilium.io/en/stable/security/policy/index.html
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-cil-clusterwidepolicies
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["cilium.io"]
-    resources: ["ciliumclusterwidenetworkpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Calico: Network policy ----
-
-# Risk: GlobalNetworkPolicy applies to pods, VMs, and host endpoints; changes broadly alter isolation
-# API Group: projectcalico.org | Resource: globalnetworkpolicies | Scope: Cluster
-# Impact: Global segmentation bypass / Host and workload exposure
-# Reference: https://docs.tigera.io/calico/latest/reference/resources/globalnetworkpolicy
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-cal-globalnetworkpolicies
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["projectcalico.org"]
-    resources: ["globalnetworkpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: Tiers define policy ordering/precedence; changing tiers can reorder evaluation and weaken guardrails
-# API Group: projectcalico.org | Resource: tiers | Scope: Cluster
-# Impact: Policy ordering bypass / Delegation control
-# Reference: https://docs.tigera.io/calico/latest/reference/resources/tier
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-cal-tiers
-    priority: CRITICAL
-  rules:
-  - apiGroups: ["projectcalico.org"]
-    resources: ["tiers"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-######################### END REGION - CRITICAL #########################
-
-######################### REGION - HIGH #########################
-
-# ---- Kubernetes: Identity / Impersonation ----
-
-# Risk: Impersonating user extras can affect authorization decisions in some setups
-# API Group: authentication.k8s.io | Resource: userextras | Scope: N/A
-# Impact: Privilege escalation / Evasion
-# Reference: https://kubernetes.io/docs/reference/access-authn-authz/user-impersonation/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-impersonate-userextras
-    priority: HIGH
-  rules:
-  # The API always spells these as a subresource ("userextras/scopes"), never
-  # as a bare "userextras", so the pattern has to cover the whole subtree.
-  - apiGroups: ["authentication.k8s.io"]
-    resources: ["userextras/*"]
-    verbs: ["impersonate"]
-
-# ---- Kubernetes: Workload execution ----
-
-# Risk: Attaching to pod provides interactive access similar to exec
-# Resource: pods/attach | Scope: Namespaced
-# Impact: Interactive access
-# Reference: https://kubernetes.io/docs/reference/using-api/api-concepts/
-
-- kind: Role
-  metadata:
-    namespace: default
+- metadata:
     name: risky-pods-attach
     priority: HIGH
+    profile: namespaced-escalation
+    category: workload-execution
   rules:
   - apiGroups: [""]
     resources: ["pods/attach"]
     verbs: ["create"]
 
-# Risk: Port-forwarding can expose internal services, enabling lateral movement
-# Resource: pods/portforward | Scope: Namespaced
-# Impact: Network access / Lateral movement
-# Reference: https://kubernetes.io/docs/reference/using-api/api-concepts/
-
-- kind: Role
-  metadata:
-    namespace: default
+# Risk: Port-forwarding exposes internal services and bypasses NetworkPolicy
+- metadata:
     name: risky-pods-portforward
     priority: HIGH
+    profile: namespaced-escalation
+    category: network
   rules:
   - apiGroups: [""]
     resources: ["pods/portforward"]
     verbs: ["create"]
 
-# Risk: Ephemeral containers enable in-place debugging access to running pods
-# Resource: pods/ephemeralcontainers | Scope: Namespaced
-# Impact: Stealth exec / Debug access
-# Reference: https://kubernetes.io/docs/reference/using-api/api-concepts/
-
-- kind: Role
-  metadata:
-    namespace: default
+# Risk: Ephemeral containers attach to a running pod without changing its spec
+- metadata:
     name: risky-pods-ephemeralcontainers
     priority: HIGH
+    profile: namespaced-escalation
+    category: workload-execution
   rules:
   - apiGroups: [""]
     resources: ["pods/ephemeralcontainers"]
     verbs: ["update", "patch"]
 
-# Risk: Updating cronjob templates can introduce persistent escalation vectors
-# API Group: batch | Resource: cronjobs | Scope: Namespaced
-# Impact: Privilege escalation / Code execution
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-cronjobs
+# Risk: Proxying into a pod reaches it without NetworkPolicy and with less audit
+- metadata:
+    name: risky-pods-proxy
     priority: HIGH
-  rules:
-  - apiGroups: ["batch"]
-    resources: ["cronjobs"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Kubernetes: Network ----
-
-# Risk: NetworkPolicy changes can open or remove network isolation
-# API Group: networking.k8s.io | Resource: networkpolicies | Scope: Namespaced
-# Impact: Lateral movement / Exfiltration
-# Reference: https://kubernetes.io/docs/reference/using-api/api-concepts/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-networkpolicies
-    priority: HIGH
-  rules:
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["networkpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: Direct manipulation of Endpoints can reroute service traffic
-# Resource: endpoints | Scope: Namespaced
-# Impact: Traffic hijack
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-endpoints
-    priority: HIGH
+    profile: namespaced-escalation
+    category: network
   rules:
   - apiGroups: [""]
-    resources: ["endpoints"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: EndpointSlice changes can reroute service traffic similar to Endpoints
-# API Group: discovery.k8s.io | Resource: endpointslices | Scope: Namespaced
-# Impact: Traffic hijack
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-endpointslices
-    priority: HIGH
-  rules:
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: Ingress changes can expose internal services publicly or change routing
-# API Group: networking.k8s.io | Resource: ingresses | Scope: Namespaced
-# Impact: External exposure
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-ingresses
-    priority: HIGH
-  rules:
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Kubernetes: Extensibility / API ----
-
-# Risk: CRDs extend the API; creating/updating affects what resources exist and how they are served
-# API Group: apiextensions.k8s.io | Resource: customresourcedefinitions | Scope: Cluster
-# Impact: Control-plane integrity
-# Reference: https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-customresourcedefinitions
-    priority: HIGH
-  rules:
-  - apiGroups: ["apiextensions.k8s.io"]
-    resources: ["customresourcedefinitions"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: APIService controls aggregated APIs; tampering can change API surface and routing
-# API Group: apiregistration.k8s.io | Resource: apiservices | Scope: Cluster
-# Impact: Control-plane integrity
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-apiservices
-    priority: HIGH
-  rules:
-  - apiGroups: ["apiregistration.k8s.io"]
-    resources: ["apiservices"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Kubernetes: Namespace security boundary ----
-
-# Risk: Namespace labels control Pod Security Standards; changing labels can weaken enforcement
-# Resource: namespaces | Scope: Cluster
-# Impact: Policy boundary / Isolation bypass
-# Reference: https://kubernetes.io/docs/tasks/configure-pod-container/enforce-standards-namespace-labels/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-namespaces
-    priority: HIGH
-  rules:
-  - apiGroups: [""]
-    resources: ["namespaces"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Kubernetes: Identity / Certificates ----
-
-# Risk: CSRs request X.509 certificates; can lead to new client credentials if approved
-# API Group: certificates.k8s.io | Resource: certificatesigningrequests | Scope: Cluster
-# Impact: Credential issuance
-# Reference: https://kubernetes.io/docs/reference/access-authn-authz/certificate-signing-requests/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-certificatesigningrequests
-    priority: HIGH
-  rules:
-  - apiGroups: ["certificates.k8s.io"]
-    resources: ["certificatesigningrequests"]
-    verbs: ["create", "get", "list", "watch", "delete", "*"]
-
-# ---- Kubernetes: Node / Kubelet access ----
-
-# Risk: Node/kubelet endpoints expose sensitive operations; access bypasses audit log
-# Resource: nodes/proxy | Scope: Cluster
-# Impact: Node compromise / Data access
-# Reference: https://kubernetes.io/docs/reference/access-authn-authz/kubelet-authn-authz/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-nodes-proxy
-    priority: HIGH
-  rules:
-  - apiGroups: [""]
-    resources: ["nodes/proxy"]
-    verbs: ["create", "get"]
-
-# ---- Kubernetes: Identity / Workload identity ----
-
-# Risk: ServiceAccounts provide pod identities; changes affect what workloads can authenticate as
-# Resource: serviceaccounts | Scope: Namespaced
-# Impact: Privilege escalation (via workload identity)
-# Reference: https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-write-serviceaccounts
-    priority: HIGH
-  rules:
-  - apiGroups: [""]
-    resources: ["serviceaccounts"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Kubernetes: Storage / Data access ----
-
-# Risk: PersistentVolumes represent backing storage; tampering may expose or redirect storage mappings
-# Resource: persistentvolumes | Scope: Cluster
-# Impact: Data exposure / Integrity
-# Reference: https://kubernetes.io/docs/tasks/configure-pod-container/configure-persistent-volume-storage/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-persistentvolumes
-    priority: HIGH
-  rules:
-  - apiGroups: [""]
-    resources: ["persistentvolumes"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: PVCs bind to PVs and enable pod access to storage; creating/modifying affects mountable data
-# Resource: persistentvolumeclaims | Scope: Namespaced
-# Impact: Data exposure / Integrity
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-persistentvolumeclaims
-    priority: HIGH
-  rules:
-  - apiGroups: [""]
-    resources: ["persistentvolumeclaims"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: StorageClass controls dynamic provisioning; changes affect how volumes are created and managed
-# API Group: storage.k8s.io | Resource: storageclasses | Scope: Cluster
-# Impact: Infrastructure impact / Data path
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-storageclasses
-    priority: HIGH
-  rules:
-  - apiGroups: ["storage.k8s.io"]
-    resources: ["storageclasses"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Kyverno: kyverno.io CRDs ----
-
-# Risk: Namespaced policies affect enforcement within a namespace
-# API Group: kyverno.io | Resource: policies | Scope: Namespaced
-# Impact: Policy bypass (namespace)
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-policies
-    priority: HIGH
-  rules:
-  - apiGroups: ["kyverno.io"]
-    resources: ["policies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: CleanupPolicy deletes existing resources on a schedule; tampering disrupts lifecycle management
-# API Group: kyverno.io | Resource: cleanuppolicies | Scope: Namespaced
-# Impact: Integrity / Availability
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-cleanuppolicies
-    priority: HIGH
-  rules:
-  - apiGroups: ["kyverno.io"]
-    resources: ["cleanuppolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: ClusterCleanupPolicy deletes resources cluster-wide on a schedule
-# API Group: kyverno.io | Resource: clustercleanuppolicies | Scope: Cluster
-# Impact: Integrity / Availability
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-clustercleanuppolicies
-    priority: HIGH
-  rules:
-  - apiGroups: ["kyverno.io"]
-    resources: ["clustercleanuppolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: GlobalContextEntries influence context data used during policy evaluation
-# API Group: kyverno.io | Resource: globalcontextentries | Scope: Cluster
-# Impact: Policy behavior manipulation
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-globalcontextentries
-    priority: HIGH
-  rules:
-  - apiGroups: ["kyverno.io"]
-    resources: ["globalcontextentries"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: UpdateRequests are intermediary resources for generate/mutate reconciliation; manipulation can disrupt or hide policy-driven changes
-# API Group: kyverno.io | Resource: updaterequests | Scope: Cluster
-# Impact: Policy engine workflow / Evasion
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-updaterequests
-    priority: HIGH
-  rules:
-  - apiGroups: ["kyverno.io"]
-    resources: ["updaterequests"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Kyverno: policies.kyverno.io CRDs ----
-
-# Risk: Namespaced ValidatingPolicy applies within namespace scope
-# API Group: policies.kyverno.io | Resource: namespacedvalidatingpolicies | Scope: Namespaced
-# Impact: Admission enforcement bypass (namespace)
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-ns-validatingpolicies
-    priority: HIGH
-  rules:
-  - apiGroups: ["policies.kyverno.io"]
-    resources: ["namespacedvalidatingpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: Namespaced MutatingPolicy applies within namespace scope
-# API Group: policies.kyverno.io | Resource: namespacedmutatingpolicies | Scope: Namespaced
-# Impact: Stealth mutation (namespace)
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-ns-mutatingpolicies
-    priority: HIGH
-  rules:
-  - apiGroups: ["policies.kyverno.io"]
-    resources: ["namespacedmutatingpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: GeneratingPolicy can create/clone resources based on triggers
-# API Group: policies.kyverno.io | Resource: generatingpolicies | Scope: Cluster
-# Impact: Resource creation / Privilege escalation
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-generatingpolicies
-    priority: HIGH
-  rules:
-  - apiGroups: ["policies.kyverno.io"]
-    resources: ["generatingpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: DeletingPolicy deletes matching resources on a schedule
-# API Group: policies.kyverno.io | Resource: deletingpolicies | Scope: Cluster
-# Impact: Integrity / Availability
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-deletingpolicies
-    priority: HIGH
-  rules:
-  - apiGroups: ["policies.kyverno.io"]
-    resources: ["deletingpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: ImageValidatingPolicy verifies image signatures/attestations; tampering bypasses supply chain controls
-# API Group: policies.kyverno.io | Resource: imagevalidatingpolicies | Scope: Cluster
-# Impact: Supply chain policy bypass
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-imagevalidatingpolicies
-    priority: HIGH
-  rules:
-  - apiGroups: ["policies.kyverno.io"]
-    resources: ["imagevalidatingpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Calico: Network policy ----
-
-# Risk: NetworkSet stores CIDRs/domains referenced by policy; changes can silently widen traffic
-# API Group: projectcalico.org | Resource: networksets | Scope: Namespaced
-# Impact: CIDR allowlist/denylist manipulation
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-cal-networksets
-    priority: HIGH
-  rules:
-  - apiGroups: ["projectcalico.org"]
-    resources: ["networksets"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: GlobalNetworkSet represents cluster-wide external CIDRs; changes can alter policy outcomes broadly
-# API Group: projectcalico.org | Resource: globalnetworksets | Scope: Cluster
-# Impact: Global CIDR allowlist/denylist manipulation
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-cal-globalnetworksets
-    priority: HIGH
-  rules:
-  - apiGroups: ["projectcalico.org"]
-    resources: ["globalnetworksets"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: HostEndpoint enforces Calico policy on host interfaces; changes can expose host-network traffic
-# API Group: projectcalico.org | Resource: hostendpoints | Scope: Cluster
-# Impact: Host traffic exposure / Segmentation bypass
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-cal-hostendpoints
-    priority: HIGH
-  rules:
-  - apiGroups: ["projectcalico.org"]
-    resources: ["hostendpoints"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-######################### END REGION - HIGH #########################
-
-######################### REGION - MEDIUM #########################
-
-# ---- Kubernetes: Workload controllers ----
-
-# Risk: Updating deployment templates can introduce escalation vectors (SA, secrets, securityContext)
-# API Group: apps | Resource: deployments | Scope: Namespaced
-# Impact: Privilege escalation / Code execution
-# Reference: https://kubernetes.io/docs/reference/using-api/api-concepts/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-deployments
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: Updating statefulset templates can introduce escalation vectors
-# API Group: apps | Resource: statefulsets | Scope: Namespaced
-# Impact: Privilege escalation / Code execution
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-statefulsets
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["apps"]
-    resources: ["statefulsets"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: Updating daemonset templates can introduce escalation vectors (runs on all nodes)
-# API Group: apps | Resource: daemonsets | Scope: Namespaced
-# Impact: Privilege escalation / Code execution
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-daemonsets
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["apps"]
-    resources: ["daemonsets"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: Updating replicaset templates can introduce escalation vectors
-# API Group: apps | Resource: replicasets | Scope: Namespaced
-# Impact: Privilege escalation / Code execution
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-replicasets
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["apps"]
-    resources: ["replicasets"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: Updating job templates can introduce escalation vectors
-# API Group: batch | Resource: jobs | Scope: Namespaced
-# Impact: Privilege escalation / Code execution
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-jobs
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Kubernetes: Workload execution ----
-
-# Risk: Pod logs can contain credentials, tokens, and sensitive internal data
-# Resource: pods/log | Scope: Namespaced
-# Impact: Data exposure
-
-- kind: Role
-  metadata:
-    namespace: default
+    resources: ["pods/proxy"]
+    verbs: ["get", "create", "update", "patch", "delete"]
+
+# Risk: Pod logs routinely contain credentials and tokens
+- metadata:
     name: risky-pods-log
     priority: MEDIUM
+    profile: namespaced-escalation
+    category: data-access
   rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
 
-# ---- Kubernetes: Network / Exposure ----
+- metadata:
+    name: risky-pods-eviction
+    priority: LOW
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
 
-# Risk: Service changes can expose workloads (LoadBalancer/NodePort) or redirect traffic
-# Resource: services | Scope: Namespaced
-# Impact: Exposure / Traffic hijack
+# Risk: Binding places a pod on a chosen node, past scheduler constraints and
+#       node taints - useful for landing on a control-plane node
+- metadata:
+    name: risky-pods-binding
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: workload-execution
+  rules:
+  - apiGroups: [""]
+    resources: ["pods/binding"]
+    verbs: ["create"]
 
-- kind: Role
-  metadata:
-    namespace: default
+- metadata:
+    name: risky-bindings
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: workload-execution
+  rules:
+  - apiGroups: [""]
+    resources: ["bindings"]
+    verbs: ["create"]
+
+######################### REGION - Workload controllers #########################
+
+# All of these reduce to "can run a pod", one indirection away.
+
+- metadata:
+    name: risky-deployments
+    priority: MEDIUM
+    profile: workload-execution
+    category: workload-execution
+  rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "update", "patch"]
+
+- metadata:
+    name: risky-statefulsets
+    priority: MEDIUM
+    profile: workload-execution
+    category: workload-execution
+  rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["create", "update", "patch"]
+
+# A DaemonSet lands a pod on every node, including control-plane nodes.
+- metadata:
+    name: risky-daemonsets
+    priority: HIGH
+    profile: workload-execution
+    category: workload-execution
+  rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["create", "update", "patch"]
+
+- metadata:
+    name: risky-replicasets
+    priority: MEDIUM
+    profile: workload-execution
+    category: workload-execution
+  rules:
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["create", "update", "patch"]
+
+- metadata:
+    name: risky-replicationcontrollers
+    priority: MEDIUM
+    profile: workload-execution
+    category: workload-execution
+  rules:
+  - apiGroups: [""]
+    resources: ["replicationcontrollers"]
+    verbs: ["create", "update", "patch"]
+
+- metadata:
+    name: risky-jobs
+    priority: MEDIUM
+    profile: workload-execution
+    category: workload-execution
+  rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "update", "patch"]
+
+# A CronJob is the same as a Job plus persistence.
+- metadata:
+    name: risky-cronjobs
+    priority: HIGH
+    profile: workload-execution
+    category: workload-execution
+  rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["create", "update", "patch"]
+
+- metadata:
+    name: risky-workload-controllers-destroy
+    priority: LOW
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["delete", "deletecollection"]
+
+- metadata:
+    name: risky-daemonsets-destroy
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["delete", "deletecollection"]
+
+# One pattern per resource, because a pattern listing several resources requires
+# the role to hold all of them.
+
+- metadata:
+    name: risky-statefulsets-destroy
+    priority: LOW
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["delete", "deletecollection"]
+
+- metadata:
+    name: risky-replicasets-destroy
+    priority: LOW
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["delete", "deletecollection"]
+
+- metadata:
+    name: risky-replicationcontrollers-destroy
+    priority: LOW
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: [""]
+    resources: ["replicationcontrollers"]
+    verbs: ["delete", "deletecollection"]
+
+- metadata:
+    name: risky-jobs-destroy
+    priority: LOW
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["delete", "deletecollection"]
+
+- metadata:
+    name: risky-cronjobs-destroy
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["delete", "deletecollection"]
+
+######################### REGION - Admission / Policy enforcement #########################
+
+# Risk: Webhook configurations decide what admission control sees and allows
+# Reference: https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/
+
+- metadata:
+    name: risky-validatingwebhookconfigurations
+    priority: CRITICAL
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingwebhookconfigurations"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Risk: A mutating webhook silently rewrites any object on its way in
+- metadata:
+    name: risky-mutatingwebhookconfigurations
+    priority: CRITICAL
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# The in-tree CEL policy engine, same enforcement role as a webhook.
+
+- metadata:
+    name: risky-validatingadmissionpolicies
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingadmissionpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-validatingadmissionpolicybindings
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingadmissionpolicybindings"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-mutatingadmissionpolicies
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingadmissionpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-mutatingadmissionpolicybindings
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingadmissionpolicybindings"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Removed in Kubernetes 1.25, still present on older clusters. 'use' on a
+# permissive PSP is what let a workload run privileged.
+- metadata:
+    name: risky-podsecuritypolicies-use
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["policy"]
+    resources: ["podsecuritypolicies"]
+    verbs: ["use"]
+
+# Risk: Namespace labels drive Pod Security Admission; relabelling switches it off
+# Reference: https://kubernetes.io/docs/tasks/configure-pod-container/enforce-standards-namespace-labels/
+- metadata:
+    name: risky-namespaces
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "update", "patch", "delete"]
+
+######################### REGION - Identity / Certificates #########################
+
+# Risk: Approving a CSR issues a client certificate for any identity it names
+# Reference: https://kubernetes.io/docs/reference/access-authn-authz/certificate-signing-requests/
+
+- metadata:
+    name: risky-csr-approval
+    priority: CRITICAL
+    scope: cluster
+    profile: cluster-scoped
+    category: credential-access
+  rules:
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests/approval"]
+    verbs: ["approve", "update"]
+
+# Approval alone issues nothing without a signer; holding the signer is the other
+# half of the same capability.
+- metadata:
+    name: risky-csr-signers
+    priority: CRITICAL
+    scope: cluster
+    profile: cluster-scoped
+    category: credential-access
+  rules:
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["signers"]
+    verbs: ["approve", "sign"]
+
+- metadata:
+    name: risky-csr-status
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: credential-access
+  rules:
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests/status"]
+    verbs: ["update", "patch"]
+
+- metadata:
+    name: risky-certificatesigningrequests
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: credential-access
+  rules:
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+
+######################### REGION - Node / Kubelet access #########################
+
+# Risk: The kubelet endpoints behind nodes/proxy run exec and read logs without
+#       passing through API-server audit
+# Reference: https://kubernetes.io/docs/reference/access-authn-authz/kubelet-authn-authz/
+
+- metadata:
+    name: risky-nodes-proxy
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: workload-execution
+  rules:
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get", "create", "update", "patch", "delete"]
+
+# Risk: Editing labels and taints steers where workloads land
+- metadata:
+    name: risky-nodes-write
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: privilege-escalation
+  rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["create", "update", "patch"]
+
+- metadata:
+    name: risky-nodes-status
+    priority: MEDIUM
+    scope: cluster
+    profile: cluster-scoped
+    category: privilege-escalation
+  rules:
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["update", "patch"]
+
+- metadata:
+    name: risky-nodes-destroy
+    priority: MEDIUM
+    scope: cluster
+    profile: cluster-scoped
+    category: availability
+  rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["delete", "deletecollection"]
+
+######################### REGION - Extensibility / API surface #########################
+
+# Risk: CRDs decide what resources exist and how they are served
+- metadata:
+    name: risky-customresourcedefinitions
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: control-plane
+  rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Risk: APIService reroutes an entire API group to a chosen backend
+- metadata:
+    name: risky-apiservices
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: control-plane
+  rules:
+  - apiGroups: ["apiregistration.k8s.io"]
+    resources: ["apiservices"]
+    verbs: ["create", "update", "patch", "delete"]
+
+######################### REGION - Network #########################
+
+- metadata:
+    name: risky-networkpolicies
+    priority: HIGH
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Risk: Writing Endpoints directly reroutes traffic for an existing Service
+- metadata:
+    name: risky-endpoints
+    priority: HIGH
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-endpointslices
+    priority: HIGH
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-ingresses
+    priority: HIGH
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-ingressclasses
+    priority: MEDIUM
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingressclasses"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
     name: risky-services
     priority: MEDIUM
+    profile: namespaced-escalation
+    category: network
   rules:
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["create", "update", "patch", "delete", "*"]
+    verbs: ["create", "update", "patch", "delete"]
 
-# ---- Kubernetes: AuthZ reconnaissance ----
+- metadata:
+    name: risky-services-proxy
+    priority: HIGH
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: [""]
+    resources: ["services/proxy"]
+    verbs: ["get", "create", "update", "patch", "delete"]
 
-# Risk: Allows checking whether an action would be allowed for any subject (recon)
-# API Group: authorization.k8s.io | Resource: subjectaccessreviews | Scope: Cluster
-# Impact: Reconnaissance
-# Reference: https://kubernetes.io/docs/reference/access-authn-authz/authorization/
+######################### REGION - Storage / Data #########################
 
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-subjectaccessreviews
+- metadata:
+    name: risky-persistentvolumes
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: data-access
+  rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-persistentvolumeclaims
     priority: MEDIUM
+    profile: namespaced-escalation
+    category: data-access
+  rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-storageclasses
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: data-access
+  rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Risk: A CSI driver runs with node-level privileges on every node it serves
+- metadata:
+    name: risky-csidrivers
+    priority: CRITICAL
+    scope: cluster
+    profile: cluster-scoped
+    category: data-access
+  rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csidrivers"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-volumeattachments
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: data-access
+  rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-csinodes
+    priority: MEDIUM
+    scope: cluster
+    profile: cluster-scoped
+    category: data-access
+  rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["create", "update", "patch", "delete"]
+
+######################### REGION - Runtime / Scheduling / Control plane #########################
+
+# Risk: RuntimeClass points a pod at a different runtime handler, e.g. away from
+#       a gVisor or Kata sandbox and onto plain runc
+- metadata:
+    name: risky-runtimeclasses
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-priorityclasses
+    priority: MEDIUM
+    scope: cluster
+    profile: cluster-scoped
+    category: availability
+  rules:
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Risk: Leases carry leader election. Writing the kube-system ones parks the
+#       controller-manager or scheduler.
+- metadata:
+    name: risky-leases
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: control-plane
+  rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-flowschemas
+    priority: LOW
+    scope: cluster
+    profile: cluster-scoped
+    category: availability
+  rules:
+  - apiGroups: ["flowcontrol.apiserver.k8s.io"]
+    resources: ["flowschemas"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-prioritylevelconfigurations
+    priority: LOW
+    scope: cluster
+    profile: cluster-scoped
+    category: availability
+  rules:
+  - apiGroups: ["flowcontrol.apiserver.k8s.io"]
+    resources: ["prioritylevelconfigurations"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Risk: the /debug endpoints expose pprof, whose heap dumps can contain tokens
+#       and secret material the API server held in memory
+# Reference: https://kubernetes.io/docs/concepts/security/api-server-bypass-risks/
+#
+# nonResourceURLs is a field of its own in RBAC, not a resource name, and only a
+# ClusterRole can grant it. Only the sensitive paths are listed: every
+# authenticated user legitimately holds /healthz, /version and /api through
+# system:discovery, so matching all non-resource URLs would be pure noise.
+- metadata:
+    name: risky-nonresourceurls-debug
+    priority: MEDIUM
+    scope: cluster
+    profile: cluster-scoped
+    category: data-access
+  rules:
+  - nonResourceURLs: ["/debug/*"]
+    verbs: ["get", "post", "*"]
+
+######################### REGION - Configuration #########################
+
+- metadata:
+    name: risky-configmaps-read
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: data-access
+  rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+
+- metadata:
+    name: risky-configmaps-write
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: data-access
+  rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "update", "patch"]
+
+- metadata:
+    name: risky-configmaps-destroy
+    priority: LOW
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["delete", "deletecollection"]
+
+# Risk: Rewriting Events erases the trace of what happened
+- metadata:
+    name: risky-events-write
+    priority: LOW
+    profile: namespaced-escalation
+    category: observability
+  rules:
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+
+######################### REGION - Reconnaissance #########################
+#
+# Every authenticated user holds selfsubject* through the built-in
+# system:basic-user ClusterRole, and every legitimate authn/authz webhook creates
+# TokenReviews and SubjectAccessReviews. These are context for other findings,
+# not findings in their own right - hence LOW across the board.
+
+- metadata:
+    name: risky-subjectaccessreviews
+    priority: LOW
+    scope: cluster
+    profile: recon
+    category: recon
   rules:
   - apiGroups: ["authorization.k8s.io"]
     resources: ["subjectaccessreviews"]
     verbs: ["create"]
 
-# Risk: Returns a list of allowed actions for the caller; helps enumerate all permissions
-# API Group: authorization.k8s.io | Resource: selfsubjectrulesreviews | Scope: Cluster
-# Impact: Reconnaissance
+- metadata:
+    name: risky-localsubjectaccessreviews
+    priority: LOW
+    profile: recon
+    category: recon
+  rules:
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["localsubjectaccessreviews"]
+    verbs: ["create"]
 
-- kind: Role
-  metadata:
-    namespace: default
+- metadata:
     name: risky-selfsubjectrulesreviews
-    priority: MEDIUM
+    priority: LOW
+    scope: cluster
+    profile: recon
+    category: recon
   rules:
   - apiGroups: ["authorization.k8s.io"]
     resources: ["selfsubjectrulesreviews"]
     verbs: ["create"]
 
-# ---- Kubernetes: AuthN reconnaissance ----
-
-# Risk: Allows validating tokens; can be used for probing token validity
-# API Group: authentication.k8s.io | Resource: tokenreviews | Scope: Cluster
-# Impact: Reconnaissance / Auth
-# Reference: https://kubernetes.io/docs/reference/access-authn-authz/authorization/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-tokenreviews
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["authentication.k8s.io"]
-    resources: ["tokenreviews"]
-    verbs: ["create"]
-
-# ---- Kubernetes: Control-plane bypass risks ----
-
-# Risk: the /debug endpoints expose pprof, whose heap dumps can contain tokens and
-#       secret material the API server held in memory
-# Resource: nonResourceURLs /debug/* | Scope: Cluster
-# Impact: Credential exposure / Recon
-# Reference: https://kubernetes.io/docs/concepts/security/api-server-bypass-risks/
-#
-# Note: nonResourceURLs is a field of its own in RBAC, not a resource name. Only
-# the sensitive paths are listed here - every authenticated user legitimately
-# holds /healthz, /version and /api through system:discovery, so matching all
-# non-resource URLs would be pure noise.
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-nonresourceurls-debug
-    priority: MEDIUM
-  rules:
-  - nonResourceURLs: ["/debug/*"]
-    verbs: ["get", "post", "*"]
-
-# ---- Kubernetes: Configuration ----
-
-# Risk: ConfigMaps can store sensitive config; reads can reveal internals, writes alter application behavior
-# Resource: configmaps | Scope: Namespaced
-# Impact: Configuration tampering / Recon
-# Reference: https://kubernetes.io/docs/concepts/configuration/configmap/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-configmaps
-    priority: MEDIUM
-  rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "*"]
-
-# ---- Kyverno: policies.kyverno.io CRDs ----
-
-# Risk: Namespaced GeneratingPolicy can create/clone resources within namespace scope
-# API Group: policies.kyverno.io | Resource: namespacedgeneratingpolicies | Scope: Namespaced
-# Impact: Resource creation (namespace)
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-ns-generatingpolicies
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["policies.kyverno.io"]
-    resources: ["namespacedgeneratingpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: Namespaced DeletingPolicy deletes matching resources within namespace scope
-# API Group: policies.kyverno.io | Resource: namespaceddeletingpolicies | Scope: Namespaced
-# Impact: Integrity / Availability (namespace)
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-ns-deletingpolicies
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["policies.kyverno.io"]
-    resources: ["namespaceddeletingpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: Namespaced ImageValidatingPolicy applies supply chain checks within namespace scope
-# API Group: policies.kyverno.io | Resource: namespacedimagevalidatingpolicies | Scope: Namespaced
-# Impact: Supply chain policy bypass (namespace)
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-ns-imagevalidatingpolicies
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["policies.kyverno.io"]
-    resources: ["namespacedimagevalidatingpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Kyverno: reports.kyverno.io ----
-
-# Risk: Manipulation of report CRDs affects security visibility and evidence
-# API Group: reports.kyverno.io | Resource: ephemeralreports | Scope: Namespaced
-# Impact: Observability / Evidence
-# Reference: https://kyverno.io/docs/guides/reports/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-rpt-ephemeralreports
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["reports.kyverno.io"]
-    resources: ["ephemeralreports"]
-    verbs: ["get", "list", "watch", "create", "delete", "update", "patch", "*"]
-
-# Risk: Cluster-scoped ephemeral reports; manipulation affects cluster-wide security visibility
-# API Group: reports.kyverno.io | Resource: clusterephemeralreports | Scope: Cluster
-# Impact: Observability / Evidence
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-kyv-rpt-clusterephemeralreports
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["reports.kyverno.io"]
-    resources: ["clusterephemeralreports"]
-    verbs: ["get", "list", "watch", "create", "delete", "update", "patch", "*"]
-
-# ---- Policy WG: wgpolicyk8s.io ----
-
-# Risk: PolicyReport summarizes policy results; changing them can hide violations
-# API Group: wgpolicyk8s.io | Resource: policyreports | Scope: Namespaced
-# Impact: Observability / Evidence
-# Reference: https://kyverno.io/docs/guides/reports/
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-wg-policyreports
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["wgpolicyk8s.io"]
-    resources: ["policyreports"]
-    verbs: ["get", "list", "watch", "create", "delete", "update", "patch", "*"]
-
-# Risk: ClusterPolicyReport summarizes cluster-wide policy results; changes can hide violations
-# API Group: wgpolicyk8s.io | Resource: clusterpolicyreports | Scope: Cluster
-# Impact: Observability / Evidence
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-wg-clusterpolicyreports
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["wgpolicyk8s.io"]
-    resources: ["clusterpolicyreports"]
-    verbs: ["get", "list", "watch", "create", "delete", "update", "patch", "*"]
-
-# ---- Calico: Staged policy / Preview ----
-
-# Risk: StagedGlobalNetworkPolicy can be abused to influence review and rollout workflows
-# API Group: projectcalico.org | Resource: stagedglobalnetworkpolicies | Scope: Cluster
-# Impact: Preview manipulation / Change-control evasion
-# Reference: https://docs.tigera.io/calico/latest/reference/resources/stagedglobalnetworkpolicy
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-cal-stagedglobalnetworkpolicies
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["projectcalico.org"]
-    resources: ["stagedglobalnetworkpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: StagedNetworkPolicy is the namespaced preview form; relevant for audit and rollout governance
-# API Group: projectcalico.org | Resource: stagednetworkpolicies | Scope: Namespaced
-# Impact: Preview manipulation / Namespace-level change-control evasion
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-cal-stagednetworkpolicies
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["projectcalico.org"]
-    resources: ["stagednetworkpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# Risk: StagedKubernetesNetworkPolicy previews K8s NetworkPolicy behavior; relevant to governance
-# API Group: projectcalico.org | Resource: stagedkubernetesnetworkpolicies | Scope: Namespaced
-# Impact: Preview manipulation of Kubernetes NetworkPolicy rollout
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-cal-stagedkubernetespolicies
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["projectcalico.org"]
-    resources: ["stagedkubernetesnetworkpolicies"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-# ---- Calico: Legacy / Supporting policy objects ----
-
-# Risk: Profiles group endpoints with shared labels and can include policy rules affecting traffic
-# API Group: projectcalico.org | Resource: profiles | Scope: Cluster
-# Impact: Legacy policy behavior / Label inheritance
-# Reference: https://docs.tigera.io/calico/latest/reference/resources/profile
-
-- kind: Role
-  metadata:
-    namespace: default
-    name: risky-cal-profiles
-    priority: MEDIUM
-  rules:
-  - apiGroups: ["projectcalico.org"]
-    resources: ["profiles"]
-    verbs: ["create", "update", "patch", "delete", "*"]
-
-######################### END REGION - MEDIUM #########################
-
-######################### REGION - LOW #########################
-
-# ---- Kubernetes: AuthZ reconnaissance ----
-
-# Risk: Allows a subject to check its own permissions; generally lower risk but useful for recon
-# API Group: authorization.k8s.io | Resource: selfsubjectaccessreviews | Scope: Cluster
-# Impact: Reconnaissance
-# Reference: https://kubernetes.io/docs/reference/access-authn-authz/authorization/
-
-- kind: Role
-  metadata:
-    namespace: default
+- metadata:
     name: risky-selfsubjectaccessreviews
     priority: LOW
+    scope: cluster
+    profile: recon
+    category: recon
   rules:
   - apiGroups: ["authorization.k8s.io"]
     resources: ["selfsubjectaccessreviews"]
     verbs: ["create"]
 
-######################### END REGION - LOW #########################
+- metadata:
+    name: risky-selfsubjectreviews
+    priority: LOW
+    scope: cluster
+    profile: recon
+    category: recon
+  rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["selfsubjectreviews"]
+    verbs: ["create"]
+
+- metadata:
+    name: risky-tokenreviews
+    priority: LOW
+    scope: cluster
+    profile: recon
+    category: recon
+  rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+
+######################### REGION - Kyverno #########################
+#
+# Policy tampering is a bypass of enforcement, not a direct cluster takeover, so
+# these sit at HIGH rather than CRITICAL. The kyverno namespace is in
+# sensitive_namespaces.yaml, which brings the namespaced ones back up when the
+# grant actually lands there.
+
+- metadata:
+    name: risky-kyv-clusterpolicies
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["kyverno.io"]
+    resources: ["clusterpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-policies
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["kyverno.io"]
+    resources: ["policies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# A PolicyException is a targeted, documented hole in enforcement.
+- metadata:
+    name: risky-kyv-policyexceptions
+    priority: HIGH
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["kyverno.io"]
+    resources: ["policyexceptions"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-cleanuppolicies
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: ["kyverno.io"]
+    resources: ["cleanuppolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-clustercleanuppolicies
+    priority: MEDIUM
+    scope: cluster
+    profile: cluster-scoped
+    category: availability
+  rules:
+  - apiGroups: ["kyverno.io"]
+    resources: ["clustercleanuppolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-globalcontextentries
+    priority: MEDIUM
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["kyverno.io"]
+    resources: ["globalcontextentries"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-updaterequests
+    priority: MEDIUM
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["kyverno.io"]
+    resources: ["updaterequests"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-validatingpolicies
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["validatingpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-mutatingpolicies
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["mutatingpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-cel-policyexceptions
+    priority: HIGH
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["policyexceptions"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-generatingpolicies
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: privilege-escalation
+  rules:
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["generatingpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-deletingpolicies
+    priority: MEDIUM
+    scope: cluster
+    profile: cluster-scoped
+    category: availability
+  rules:
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["deletingpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-imagevalidatingpolicies
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["imagevalidatingpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-ns-validatingpolicies
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["namespacedvalidatingpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-ns-mutatingpolicies
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["namespacedmutatingpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-ns-generatingpolicies
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: privilege-escalation
+  rules:
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["namespacedgeneratingpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-ns-deletingpolicies
+    priority: LOW
+    profile: namespaced-escalation
+    category: availability
+  rules:
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["namespaceddeletingpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-kyv-ns-imagevalidatingpolicies
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["namespacedimagevalidatingpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+######################### REGION - Policy reporting #########################
+#
+# Rewriting a report hides a violation but does not create one. Evidence, not
+# enforcement - LOW.
+
+- metadata:
+    name: risky-kyv-rpt-ephemeralreports
+    priority: LOW
+    profile: namespaced-escalation
+    category: observability
+  rules:
+  - apiGroups: ["reports.kyverno.io"]
+    resources: ["ephemeralreports"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+
+- metadata:
+    name: risky-kyv-rpt-clusterephemeralreports
+    priority: LOW
+    scope: cluster
+    profile: cluster-scoped
+    category: observability
+  rules:
+  - apiGroups: ["reports.kyverno.io"]
+    resources: ["clusterephemeralreports"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+
+- metadata:
+    name: risky-wg-policyreports
+    priority: LOW
+    profile: namespaced-escalation
+    category: observability
+  rules:
+  - apiGroups: ["wgpolicyk8s.io"]
+    resources: ["policyreports"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+
+- metadata:
+    name: risky-wg-clusterpolicyreports
+    priority: LOW
+    scope: cluster
+    profile: cluster-scoped
+    category: observability
+  rules:
+  - apiGroups: ["wgpolicyk8s.io"]
+    resources: ["clusterpolicyreports"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+
+# Reading a report is mild reconnaissance rather than a change: it maps exactly
+# which workloads already fail policy, and therefore where to go first.
+
+- metadata:
+    name: risky-kyv-rpt-ephemeralreports-read
+    priority: LOW
+    profile: recon
+    category: recon
+  rules:
+  - apiGroups: ["reports.kyverno.io"]
+    resources: ["ephemeralreports"]
+    verbs: ["get", "list", "watch"]
+
+- metadata:
+    name: risky-kyv-rpt-clusterephemeralreports-read
+    priority: LOW
+    scope: cluster
+    profile: recon
+    category: recon
+  rules:
+  - apiGroups: ["reports.kyverno.io"]
+    resources: ["clusterephemeralreports"]
+    verbs: ["get", "list", "watch"]
+
+- metadata:
+    name: risky-wg-policyreports-read
+    priority: LOW
+    profile: recon
+    category: recon
+  rules:
+  - apiGroups: ["wgpolicyk8s.io"]
+    resources: ["policyreports"]
+    verbs: ["get", "list", "watch"]
+
+- metadata:
+    name: risky-wg-clusterpolicyreports-read
+    priority: LOW
+    scope: cluster
+    profile: recon
+    category: recon
+  rules:
+  - apiGroups: ["wgpolicyk8s.io"]
+    resources: ["clusterpolicyreports"]
+    verbs: ["get", "list", "watch"]
+
+######################### REGION - OPA Gatekeeper #########################
+
+# Risk: A ConstraintTemplate is the Rego behind every constraint built on it
+- metadata:
+    name: risky-opa-constrainttemplates
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["templates.gatekeeper.sh"]
+    resources: ["constrainttemplates"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Constraint kinds are generated per template, so they cannot be enumerated here.
+# Gatekeeper RBAC is conventionally written against the whole group, which is
+# what this matches.
+- metadata:
+    name: risky-opa-constraints
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["constraints.gatekeeper.sh"]
+    resources: ["*"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-opa-mutations
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["mutations.gatekeeper.sh"]
+    resources: ["*"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-opa-externaldata-providers
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["externaldata.gatekeeper.sh"]
+    resources: ["providers"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-opa-configs
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["config.gatekeeper.sh"]
+    resources: ["configs"]
+    verbs: ["create", "update", "patch", "delete"]
+
+######################### REGION - Tetragon #########################
+
+# Risk: TracingPolicy is the runtime detection and enforcement rule set. Editing
+#       it switches off the sensor that is supposed to catch everything else.
+
+- metadata:
+    name: risky-tetragon-tracingpolicies
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: observability
+  rules:
+  - apiGroups: ["cilium.io"]
+    resources: ["tracingpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-tetragon-tracingpolicies-namespaced
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: observability
+  rules:
+  - apiGroups: ["cilium.io"]
+    resources: ["tracingpoliciesnamespaced"]
+    verbs: ["create", "update", "patch", "delete"]
+
+######################### REGION - Cilium #########################
+
+- metadata:
+    name: risky-cil-networkpolicies
+    priority: HIGH
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumnetworkpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cil-clusterwidepolicies
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumclusterwidenetworkpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Risk: CiliumEnvoyConfig injects raw Envoy configuration into the data path
+- metadata:
+    name: risky-cil-envoyconfigs
+    priority: HIGH
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumenvoyconfigs"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cil-clusterwideenvoyconfigs
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumclusterwideenvoyconfigs"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Risk: Identities and endpoints are what policy decisions are keyed on
+- metadata:
+    name: risky-cil-identities
+    priority: MEDIUM
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumidentities"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cil-endpoints
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumendpoints"]
+    verbs: ["create", "update", "patch", "delete"]
+
+######################### REGION - Calico #########################
+
+- metadata:
+    name: risky-cal-globalnetworkpolicies
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["globalnetworkpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cal-networkpolicies
+    priority: HIGH
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Risk: Tiers define evaluation order, so reordering them defeats guardrails
+#       without editing a single policy
+- metadata:
+    name: risky-cal-tiers
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["tiers"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cal-networksets
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["networksets"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cal-globalnetworksets
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["globalnetworksets"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cal-hostendpoints
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["hostendpoints"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Risk: IP pools, BGP and Felix configuration are the data plane itself
+- metadata:
+    name: risky-cal-ippools
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["ippools"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cal-bgpconfigurations
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["bgpconfigurations"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cal-bgppeers
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["bgppeers"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cal-felixconfigurations
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["felixconfigurations"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cal-profiles
+    priority: MEDIUM
+    scope: cluster
+    profile: cluster-scoped
+    category: network
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["profiles"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Staged policies are previews that never enforce; they matter for change
+# control, not for live segmentation.
+
+- metadata:
+    name: risky-cal-stagedglobalnetworkpolicies
+    priority: LOW
+    scope: cluster
+    profile: cluster-scoped
+    category: policy-bypass
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["stagedglobalnetworkpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cal-stagednetworkpolicies
+    priority: LOW
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["stagednetworkpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-cal-stagedkubernetespolicies
+    priority: LOW
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["projectcalico.org"]
+    resources: ["stagedkubernetesnetworkpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+######################### REGION - Istio #########################
+
+# Risk: AuthorizationPolicy is the mesh's authz decision; PeerAuthentication
+#       decides whether mTLS is required at all
+
+- metadata:
+    name: risky-istio-authorizationpolicies
+    priority: HIGH
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["security.istio.io"]
+    resources: ["authorizationpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-istio-peerauthentications
+    priority: HIGH
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["security.istio.io"]
+    resources: ["peerauthentications"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-istio-requestauthentications
+    priority: HIGH
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["security.istio.io"]
+    resources: ["requestauthentications"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# Risk: EnvoyFilter is arbitrary proxy configuration - the mesh equivalent of a
+#       mutating webhook over live traffic
+- metadata:
+    name: risky-istio-envoyfilters
+    priority: HIGH
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: ["networking.istio.io"]
+    resources: ["envoyfilters"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-istio-traffic-routing
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: ["networking.istio.io"]
+    resources: ["virtualservices"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-istio-destinationrules
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: ["networking.istio.io"]
+    resources: ["destinationrules"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-istio-gateways
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: network
+  rules:
+  - apiGroups: ["networking.istio.io"]
+    resources: ["gateways"]
+    verbs: ["create", "update", "patch", "delete"]
+
+######################### REGION - cert-manager #########################
+
+# Risk: An Issuer mints certificates. A ClusterIssuer mints them for every
+#       namespace, which is an identity factory for anything doing mTLS.
+
+- metadata:
+    name: risky-certmanager-clusterissuers
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: credential-access
+  rules:
+  - apiGroups: ["cert-manager.io"]
+    resources: ["clusterissuers"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-certmanager-issuers
+    priority: HIGH
+    profile: namespaced-escalation
+    category: credential-access
+  rules:
+  - apiGroups: ["cert-manager.io"]
+    resources: ["issuers"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-certmanager-certificates
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: credential-access
+  rules:
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-certmanager-certificaterequests
+    priority: MEDIUM
+    profile: namespaced-escalation
+    category: credential-access
+  rules:
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificaterequests"]
+    verbs: ["create", "update", "patch", "delete"]
+
+######################### REGION - External Secrets #########################
+
+# Risk: A SecretStore holds the credentials for the external vault, and an
+#       ExternalSecret decides which of its contents land in the cluster.
+
+- metadata:
+    name: risky-eso-clustersecretstores
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: credential-access
+  rules:
+  - apiGroups: ["external-secrets.io"]
+    resources: ["clustersecretstores"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-eso-clusterexternalsecrets
+    priority: HIGH
+    scope: cluster
+    profile: cluster-scoped
+    category: credential-access
+  rules:
+  - apiGroups: ["external-secrets.io"]
+    resources: ["clusterexternalsecrets"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-eso-secretstores
+    priority: HIGH
+    profile: namespaced-escalation
+    category: credential-access
+  rules:
+  - apiGroups: ["external-secrets.io"]
+    resources: ["secretstores"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-eso-externalsecrets
+    priority: HIGH
+    profile: namespaced-escalation
+    category: credential-access
+  rules:
+  - apiGroups: ["external-secrets.io"]
+    resources: ["externalsecrets"]
+    verbs: ["create", "update", "patch", "delete"]
+
+######################### REGION - Argo CD #########################
+
+# Risk: Argo CD deploys with its own, usually cluster-wide, privileges. Writing
+#       an Application makes it deploy whatever you point it at, wherever its
+#       AppProject allows - a classic delegated-escalation path.
+
+- metadata:
+    name: risky-argo-applications
+    priority: HIGH
+    profile: namespaced-escalation
+    category: privilege-escalation
+  rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["create", "update", "patch", "delete"]
+
+- metadata:
+    name: risky-argo-applicationsets
+    priority: HIGH
+    profile: namespaced-escalation
+    category: privilege-escalation
+  rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["applicationsets"]
+    verbs: ["create", "update", "patch", "delete"]
+
+# AppProject is the guardrail that says where Applications may deploy.
+- metadata:
+    name: risky-argo-appprojects
+    priority: HIGH
+    profile: namespaced-escalation
+    category: policy-bypass
+  rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["appprojects"]
+    verbs: ["create", "update", "patch", "delete"]
+
+######################### REGION - Escalation chains #########################
+#
+# Multi-rule patterns: every rule must be satisfied, possibly by different rules
+# of the same role. These describe combinations that are worth more than the sum
+# of their parts, and they are what the single-permission patterns above cannot
+# express.
+
+# Create the identity, then grant it whatever you like. Neither half needs any
+# pre-existing privileged account to be useful.
+- metadata:
+    name: risky-chain-selfservice-identity
+    priority: CRITICAL
+    profile: namespaced-escalation
+    category: privilege-escalation
+  rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["create"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["create"]
+
+# Run a workload, then read the credentials it was allowed to mount.
+- metadata:
+    name: risky-chain-pod-and-secrets
+    priority: CRITICAL
+    profile: namespaced-escalation
+    category: credential-access
+  rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+
+# Mint a token for an existing account, having first found out which accounts
+# exist and what they are worth.
+- metadata:
+    name: risky-chain-token-minting
+    priority: CRITICAL
+    profile: namespaced-escalation
+    category: credential-access
+  rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list"]
 
 ######################### END REGION - Risky permissions combinations #########################

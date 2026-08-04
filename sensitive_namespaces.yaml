@@ -1,0 +1,58 @@
+# Namespaces where an otherwise ordinary permission becomes a cluster-level
+# problem. A finding whose pattern declares the 'sensitiveNamespace' modifier is
+# raised by one level when it lands in one of these.
+#
+# What belongs here: namespaces holding control-plane components, cluster-wide
+# credentials, policy enforcement, or observability. "Can create a pod in
+# monitoring" is not the same risk as "can create a pod in team-sandbox",
+# because the first one sits next to Grafana admin credentials and a Splunk HEC
+# token while the second sits next to nothing.
+#
+# The groups are purely documentation - the scanner flattens them into one set.
+# Override the whole list from the command line with --sensitive-namespaces,
+# or add to it with --sensitive-namespaces-add.
+
+groups:
+
+  # Namespaces the Kubernetes control plane owns itself.
+  kubernetes:
+    - kube-system
+    - kube-public
+    - kube-node-lease
+
+  # Rancher / RKE distributions place control-plane add-ons of their own here.
+  rancher:
+    - cattle-system
+    - cattle-prometheus
+    - cattle-monitoring-system
+    - fleet-system
+    - ingress-nginx
+
+  # Policy enforcement and runtime security. A subject able to write here can
+  # switch off the control that is supposed to catch everything else.
+  policy_and_runtime_security:
+    - kyverno
+    - gatekeeper-system
+    - opa
+    - tetragon
+    - node-problem-detector
+
+  # Platform infrastructure: secret delivery, certificates, GitOps, storage and
+  # observability. Each of these holds credentials for something outside the
+  # cluster, or the ability to deploy into every other namespace.
+  infrastructure:
+    - argocd
+    - cert-manager
+    - external-secrets
+    - istio-system
+    - infra
+    - logging
+    - monitoring
+    - splunk
+    - coroot
+    - cadvisor
+    - goldilocks
+    - longhorn-system
+    - csi-s3
+    - nfs-sc
+    - goofys

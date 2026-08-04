@@ -14,6 +14,8 @@ import datetime
 from api.api_client import api_init, running_in_container
 from api.client_factory import ApiClientFactory
 from api.config import set_api_client, Config
+from engine.scan_context import configure_sensitive_namespaces
+from engine.finding import format_api_group
 
 json_filename = ""
 output_file = ""
@@ -93,12 +95,6 @@ def print_all_risky_roles(show_rules=False, days=None, priority=None, namespace=
         risky_any_roles = filter_objects_less_than_days(int(days), risky_any_roles)
     if priority:
         risky_any_roles = filter_objects_by_priority(priority, risky_any_roles)
-    all_rb = Config.api_client.list_role_binding_for_all_namespaces()
-    all_crb = Config.api_client.list_cluster_role_binding()
-    for role in risky_any_roles:
-        role.bound_service_accounts = engine.utils.get_service_accounts_for_role(
-            role.name, role.kind, role.namespace, all_rb, all_crb
-        )
     generic_print('|Risky Roles and ClusterRoles|', risky_any_roles, show_rules)
 
 
@@ -112,22 +108,10 @@ def print_risky_roles(show_rules=False, days=None, priority=None, namespace=None
     if priority:
         risky_roles = filter_objects_by_priority(priority, risky_roles)
 
-    all_rb = Config.api_client.list_role_binding_for_all_namespaces()
-    all_crb = Config.api_client.list_cluster_role_binding()
-    filtered_risky_roles = []
     if namespace is None:
-        for role in risky_roles:
-            role.bound_service_accounts = engine.utils.get_service_accounts_for_role(
-                role.name, role.kind, role.namespace, all_rb, all_crb
-            )
         generic_print('|Risky Roles |', risky_roles, show_rules)
     else:
-        for risky_role in risky_roles:
-            if risky_role.namespace == namespace:
-                risky_role.bound_service_accounts = engine.utils.get_service_accounts_for_role(
-                    risky_role.name, risky_role.kind, risky_role.namespace, all_rb, all_crb
-                )
-                filtered_risky_roles.append(risky_role)
+        filtered_risky_roles = [role for role in risky_roles if role.namespace == namespace]
         generic_print('|Risky Roles |', filtered_risky_roles, show_rules)
 
 
@@ -255,12 +239,6 @@ def print_risky_clusterroles(show_rules=False, days=None, priority=None, namespa
         risky_clusterroles = filter_objects_less_than_days(int(days), risky_clusterroles)
     if priority:
         risky_clusterroles = filter_objects_by_priority(priority, risky_clusterroles)
-    all_rb = Config.api_client.list_role_binding_for_all_namespaces()
-    all_crb = Config.api_client.list_cluster_role_binding()
-    for role in risky_clusterroles:
-        role.bound_service_accounts = engine.utils.get_service_accounts_for_role(
-            role.name, role.kind, role.namespace, all_rb, all_crb
-        )
     generic_print('|Risky ClusterRoles |', risky_clusterroles, show_rules)
 
 def print_all_risky_rolebindings(days=None, priority=None, namespace=None, include_system=False):
@@ -487,7 +465,7 @@ def get_pretty_rules(rules):
             # groups, so verbs alone do not identify what the rule really grants.
             api_groups = getattr(rule, 'api_groups', None) or ['?']
             groups_string = '[' + ','.join(
-                engine.utils.format_api_group(group) for group in api_groups) + '] '
+                format_api_group(group) for group in api_groups) + '] '
 
             resources_string = '('
             if rule.resources is None:
@@ -786,6 +764,11 @@ Requirements:
     helper_switches.add_argument('-nc', '--no-color', action='store_true', help='Print without color')
     helper_switches.add_argument('--include-system', action='store_true',
                                  help='Include system roles (system:*) in output. They are excluded by default.')
+    helper_switches.add_argument('--sensitive-namespaces', metavar='NS[,NS...]',
+                                 help='Replace the sensitive-namespace list from sensitive_namespaces.yaml.\n'
+                                      'A finding landing in one of these is raised by one level.')
+    helper_switches.add_argument('--sensitive-namespaces-add', metavar='NS[,NS...]',
+                                 help='Add to the sensitive-namespace list instead of replacing it.')
     associated_rb_crb_to_role = opt.add_argument_group('Associated RoleBindings\ClusterRoleBindings to Role', description='Use the switch: namespace (-ns\--namespace).')
     associated_rb_crb_to_role.add_argument('-aarbr', '--associated-any-rolebindings-role', action='store', metavar='ROLE_NAME',
                                            help='Get associated RoleBindings\ClusterRoleBindings to a specific role\n'
@@ -846,6 +829,11 @@ Requirements:
     
     set_api_client(api_client)
 
+    if args.sensitive_namespaces or args.sensitive_namespaces_add:
+        def split(value):
+            return [ns.strip() for ns in value.split(',') if ns.strip()] if value else None
+        configure_sensitive_namespaces(replace=split(args.sensitive_namespaces),
+                                       extra=split(args.sensitive_namespaces_add))
 
     if args.cve:
         print_cve(args.cert_filename, args.client_certificate, args.client_key, args.host)
