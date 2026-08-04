@@ -1,0 +1,189 @@
+# Mock RBAC for exercising the context-aware scoring on a live cluster.
+# Every object is prefixed 'mock-' and lives in namespaces 'mock-team-a' and
+# 'mock-payments', so the whole set can be removed with a single delete.
+#
+# Each block names the modifier it is there to trigger.
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: mock-team-a}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: mock-payments}
+---
+# ---------------------------------------------------------------- unbound (-1)
+# Critical permission on a ClusterRole nobody is bound to: a latent risk.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: mock-secrets-reader-unbound}
+rules:
+- {apiGroups: [""], resources: ["secrets"], verbs: ["get", "list"]}
+---
+# ------------------------------------- clusterWide (+1) + boundToEveryone (+1)
+# The worst shape there is: every authenticated user reads every secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: mock-secrets-reader-everyone}
+rules:
+- {apiGroups: [""], resources: ["secrets"], verbs: ["get", "list"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: mock-secrets-reader-everyone}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: mock-secrets-reader-everyone}
+subjects:
+- {kind: Group, name: system:authenticated, apiGroup: rbac.authorization.k8s.io}
+---
+# ------------------------------------------------------- base case, no modifier
+# The same permission in one ordinary namespace, granted to one account.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: mock-app, namespace: mock-team-a}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: mock-secrets-team, namespace: mock-team-a}
+rules:
+- {apiGroups: [""], resources: ["secrets"], verbs: ["get", "list"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: mock-secrets-team, namespace: mock-team-a}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: mock-secrets-team}
+subjects:
+- {kind: ServiceAccount, name: mock-app, namespace: mock-team-a}
+---
+# ------------------------------------------------------ sensitiveNamespace (+1)
+# The same permission again, this time in kube-system.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: mock-ks-app, namespace: kube-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: mock-secrets-kube-system, namespace: kube-system}
+rules:
+- {apiGroups: [""], resources: ["secrets"], verbs: ["get", "list"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: mock-secrets-kube-system, namespace: kube-system}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: mock-secrets-kube-system}
+subjects:
+- {kind: ServiceAccount, name: mock-ks-app, namespace: kube-system}
+---
+# -------------------------------------------------- resourceNamesRestricted (-1)
+# Read of exactly one named Secret, on a verb RBAC narrows by name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: mock-secrets-pinned, namespace: mock-team-a}
+rules:
+- {apiGroups: [""], resources: ["secrets"], resourceNames: ["mock-app-tls"], verbs: ["get"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: mock-secrets-pinned, namespace: mock-team-a}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: mock-secrets-pinned}
+subjects:
+- {kind: ServiceAccount, name: mock-app, namespace: mock-team-a}
+---
+# --------------------------------------------------- namespacedBindingOnly (-1)
+# Cluster-scoped permission on a ClusterRole that only a RoleBinding references:
+# the rule never takes effect.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: mock-clusterroles-writer}
+rules:
+- {apiGroups: ["rbac.authorization.k8s.io"], resources: ["clusterroles"], verbs: ["create", "update"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: mock-clusterroles-writer, namespace: mock-team-a}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: mock-clusterroles-writer}
+subjects:
+- {kind: ServiceAccount, name: mock-app, namespace: mock-team-a}
+---
+# ------------------------------------------- clusterWide (+1) on the same rules
+# Identical permission, this time behind a ClusterRoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: mock-clusterroles-writer-cluster}
+rules:
+- {apiGroups: ["rbac.authorization.k8s.io"], resources: ["clusterroles"], verbs: ["create", "update"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: mock-clusterroles-writer-cluster}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: mock-clusterroles-writer-cluster}
+subjects:
+- {kind: ServiceAccount, name: mock-app, namespace: mock-team-a}
+---
+# ------------------------------------------------- privilegedSaReachable (+1)
+# 'mock-privileged' is critical in its own right (cluster-wide impersonate).
+# 'mock-pod-creator' can create pods in the namespace that hosts it, so it can
+# run a workload under that identity.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: mock-privileged, namespace: mock-payments}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: mock-impersonator}
+rules:
+- {apiGroups: [""], resources: ["users", "groups", "serviceaccounts"], verbs: ["impersonate"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: mock-impersonator}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: mock-impersonator}
+subjects:
+- {kind: ServiceAccount, name: mock-privileged, namespace: mock-payments}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: mock-deployer, namespace: mock-payments}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: mock-pod-creator, namespace: mock-payments}
+rules:
+- {apiGroups: [""], resources: ["pods"], verbs: ["create"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: mock-pod-creator, namespace: mock-payments}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: mock-pod-creator}
+subjects:
+- {kind: ServiceAccount, name: mock-deployer, namespace: mock-payments}
+---
+# ------------------------------------------------------- wildcard collapse
+# A role holding everything must produce one finding, not 170.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: mock-wildcard-admin}
+rules:
+- {apiGroups: ["*"], resources: ["*"], verbs: ["*"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: mock-wildcard-admin}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: mock-wildcard-admin}
+subjects:
+- {kind: ServiceAccount, name: mock-app, namespace: mock-team-a}
+---
+# ------------------- NEGATIVE: cluster-scoped resource inside a namespaced Role
+# 'nodes/proxy' cannot be granted by a Role. Must not be reported at all.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: mock-negative-node-proxy, namespace: mock-team-a}
+rules:
+- {apiGroups: [""], resources: ["nodes/proxy"], verbs: ["get"]}
+---
+# ----------------------------- NEGATIVE: a vendor CRD that is called 'secrets'
+# Same resource name, different API group. Must not match the core Secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: mock-negative-vendor-secrets, namespace: mock-team-a}
+rules:
+- {apiGroups: ["vault.example.com"], resources: ["secrets"], verbs: ["get", "list", "delete"]}
