@@ -44,16 +44,18 @@ def adjust(priority, delta):
 
 
 def _cluster_wide(finding, role, ctx):
+    """The binding names are detail only for --explain: the one-line form says
+    'clusterWide', and the same event already lists every binding by name."""
     if ctx.is_cluster_wide(role):
         names = [b.name for b in ctx.bindings_for(role) if b.is_cluster_wide]
-        return True, 'cluster-wide via ClusterRoleBinding: ' + ', '.join(sorted(names))
-    return False, None
+        return True, 'cluster-wide via ClusterRoleBinding: ' + ', '.join(sorted(names)), None
+    return False, None, None
 
 
 def _namespaced_binding_only(finding, role, ctx):
     if ctx.is_namespaced_binding_only(role):
-        return True, 'ClusterRole bound only by RoleBindings, cluster-scoped rules inert'
-    return False, None
+        return True, 'ClusterRole bound only by RoleBindings, cluster-scoped rules inert', None
+    return False, None, None
 
 
 def _sensitive_namespace(finding, role, ctx):
@@ -61,44 +63,48 @@ def _sensitive_namespace(finding, role, ctx):
     # and 'clusterWide' has accounted for it. Counting both would double-charge
     # the same fact.
     if ctx.is_cluster_wide(role):
-        return False, None
+        return False, None, None
     hit = ctx.sensitive_namespaces_hit(role)
     if hit:
-        return True, 'sensitive namespace: ' + ', '.join(hit)
-    return False, None
+        return True, 'sensitive namespace: ' + ', '.join(hit), ', '.join(hit)
+    return False, None, None
 
 
 def _bound_to_everyone(finding, role, ctx):
     """Handed to every user of the cluster, authenticated or not."""
     groups = ctx.bound_to_everyone(role)
     if groups:
-        return True, 'granted to ' + ', '.join(groups)
-    return False, None
+        return True, 'granted to ' + ', '.join(groups), ', '.join(groups)
+    return False, None, None
 
 
 def _privileged_sa_reachable(finding, role, ctx):
-    return ctx.reaches_privileged_sa(role)
+    matched, accounts = ctx.reaches_privileged_sa(role)
+    if not matched:
+        return False, None, None
+    return True, 'critical service account reachable: ' + accounts, accounts
 
 
 def _resource_names_restricted(finding, role, ctx):
     """Every matched rule is pinned to named objects, on verbs that respect it."""
     if not finding.rule_matches:
-        return False, None
+        return False, None, None
     names = []
     for match in finding.rule_matches:
         restricted = getattr(match.source_rule, 'resource_names', None)
         if not restricted:
-            return False, None
+            return False, None, None
         if set(v.lower() for v in match.matched_verbs) & RESOURCE_NAME_IGNORING_VERBS:
-            return False, None
+            return False, None, None
         names.extend(restricted)
-    return True, 'restricted to resourceNames: ' + ', '.join(sorted(set(names)))
+    shown = ', '.join(sorted(set(names)))
+    return True, 'restricted to resourceNames: ' + shown, shown
 
 
 def _unbound(finding, role, ctx):
     if not ctx.is_bound(role):
-        return True, 'no RoleBinding or ClusterRoleBinding references this role'
-    return False, None
+        return True, 'no RoleBinding or ClusterRoleBinding references this role', None
+    return False, None, None
 
 
 MODIFIER_EVALUATORS = {
@@ -125,21 +131,25 @@ def evaluate_modifiers(finding, role, ctx, second_pass=False):
         evaluator = MODIFIER_EVALUATORS.get(name)
         if evaluator is None:
             continue
-        matched, explanation = evaluator(finding, role, ctx)
+        matched, explanation, detail = evaluator(finding, role, ctx)
         if matched:
             delta += configured
-            applied.append(AppliedModifier(name, configured, explanation))
+            applied.append(AppliedModifier(name, configured, explanation, detail))
     return delta, applied
 
 
-def compute_priority(finding, role, ctx, second_pass=False):
-    """Effective priority of a finding under a given context, non-destructively.
+def score_findings_for_scope(findings, role, ctx, second_pass=False):
+    """Score findings in a narrower context, returning copies.
 
-    Used to score a single binding without disturbing the role-level finding,
-    which is scored against every binding at once.
+    Used for one binding, where the report needs the same arithmetic the role
+    level shows - which modifier fired and why - while the role-level findings
+    keep the worst case across every binding.
     """
-    delta, _ = evaluate_modifiers(finding, role, ctx, second_pass)
-    return adjust(finding.base_priority, delta)
+    scored = []
+    for finding in findings:
+        delta, applied = evaluate_modifiers(finding, role, ctx, second_pass)
+        scored.append(finding.rescored(adjust(finding.base_priority, delta), applied))
+    return scored
 
 
 def score_finding(finding, role, ctx, second_pass=False):

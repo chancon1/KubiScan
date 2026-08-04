@@ -212,6 +212,9 @@ class ScanContext:
     def reaches_privileged_sa(self, role):
         """Can this grant borrow an identity better than the one it already has?
 
+        Returns the accounts it can borrow, not a sentence about them: how that
+        reads in a report is the report's business.
+
         Service accounts already bound to this very role are excluded. An
         operator whose own account holds both "create pods" and a cluster-wide
         permission is not escalating by running a pod as itself - it is using
@@ -238,7 +241,7 @@ class ScanContext:
         shown = ', '.join(reachable[:3])
         if len(reachable) > 3:
             shown += ' (+{0} more)'.format(len(reachable) - 3)
-        return True, 'critical service account reachable: ' + shown
+        return True, shown
 
 
 class SingleBindingContext(ScanContext):

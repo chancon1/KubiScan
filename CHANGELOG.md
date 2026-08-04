@@ -23,9 +23,14 @@ permission was actually granted, not by a constant attached to the pattern.
   everything except `privilegedSaReachable`; the map of already-critical
   service accounts is built from its result, then the second pass settles the
   affected findings. The map is never consulted while it is being built.
-- `engine/finding.py` - `Finding`, `RuleMatch` and `AppliedModifier`. A report
-  now shows the score arithmetic (`HIGH -> CRITICAL`), the matched rules with
-  their apiGroup, and every modifier with its delta and reason.
+- `engine/finding.py` - `Finding`, `RuleMatch` and `AppliedModifier`. A finding
+  renders as one line - `risky-secrets-read: HIGH -> CRITICAL (clusterWide)` -
+  which is what the report and the JSON events carry. The findings are read as
+  Splunk events, one field per line, so a four-line block per matched pattern
+  pushed the rest of the event off the screen: a role matching six patterns
+  spent 24 lines saying what now takes six.
+- `--explain` restores the full block per finding: the matched rules with their
+  apiGroup and one line per modifier with its delta and reason.
 - `engine/risky_pattern.py` - a matrix entry is a pattern, not a `Role`.
 - `sensitive_namespaces.yaml` plus `--sensitive-namespaces` and
   `--sensitive-namespaces-add` to replace or extend the shipped list.
@@ -34,15 +39,24 @@ permission was actually granted, not by a constant attached to the pattern.
 - Matrix grew from 80 to 170 patterns across 10 categories, 76 of them
   cluster-scoped.
 - Test suite under `tests/` (`python tests/run_all.py`, no cluster needed).
-  `tests/fixtures/detected_permissions.txt` baselines all 556 permissions the
+  `tests/fixtures/detected_permissions.txt` baselines all 553 permissions the
   matrix can detect, so losing one shows up as a deleted line rather than as
-  silence.
+  silence. One guard is there for the log pipeline rather than for the model:
+  every string a report can emit - pattern names, categories, modifier names
+  and their explanations - must stay ASCII, since the findings are parsed
+  downstream by a log collector.
 
 ### Changed
 - RoleBindings and ClusterRoleBindings are scored per binding rather than
   inheriting the role's worst case. A ClusterRole granting
   `create clusterrolebindings` is critical behind a ClusterRoleBinding and
   inert behind a namespaced RoleBinding.
+- The binding reports (`-rb`, `-rcb`, `-rab`) explain their own verdict. Their
+  `Triggered By` column used to be empty, which left the one report that can
+  name the guilty binding - ten RoleBindings at HIGH and the single
+  ClusterRoleBinding at CRITICAL - with no reason attached to either number.
+  Each binding now carries the same arithmetic the role level shows, scored in
+  its own scope: `CRITICAL -> HIGH`, `-1 namespacedBindingOnly`.
 - Bound subjects are read from the scan context instead of being recomputed in
   each print function; removed four duplicated blocks from `KubiScan.py`.
 - The scan is memoised, so the several report switches of one run no longer
@@ -52,6 +66,11 @@ permission was actually granted, not by a constant attached to the pattern.
   whether a `resourceNames` restriction narrows anything.
 
 ### Fixed
+- The `Rules` column no longer ends in a stray newline, which rendered as an
+  empty line in the table and as a blank field line in the JSON events.
+- The table caps its free-text columns at 55 characters and wraps instead of
+  running past 250. The JSON export is taken before wrapping and keeps the full
+  text.
 - `apiGroups: ["*"]` in a pattern now means group-unrestricted access
   specifically, satisfied only by a source rule that also says `"*"`. Total
   control of one API group is expressed with `matchesAnyApiGroup: true`. The

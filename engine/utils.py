@@ -4,7 +4,7 @@ from engine.role import Role
 from engine.priority import Priority
 from engine.finding import Finding, RuleMatch
 from engine.scan_context import BoundBinding, ScanContext
-from engine.scoring import compute_priority, score_finding, highest_priority
+from engine.scoring import score_finding, score_findings_for_scope, highest_priority
 from static_risky_roles import STATIC_RISKY_ROLES
 from engine.role_binding import RoleBinding
 from kubernetes.stream import stream
@@ -370,23 +370,22 @@ def is_risky_rolebinding(risky_roles, rolebinding):
     return True, risky_role.priority
 
 
-def priority_for_binding(risky_role, rolebinding, kind, ctx):
+def findings_for_binding(risky_role, rolebinding, kind, ctx):
     """Score a role's findings for the scope of one specific binding.
 
     The role-level priority is the worst case across every binding it has. A
     single binding is usually narrower than that: a ClusterRole granting
     'create clusterrolebindings' is critical when a ClusterRoleBinding hands it
     out, and inert when only a namespaced RoleBinding does.
+
+    The findings come back as copies, so the binding report can show the
+    arithmetic behind its own verdict - which is the only place that verdict is
+    explained - without disturbing the role-level one.
     """
     scoped = ctx.scoped_to(BoundBinding(kind, rolebinding.metadata.name,
                                         rolebinding.metadata.namespace,
                                         rolebinding.subjects))
-    highest = Priority.NONE
-    for finding in risky_role.findings:
-        priority = compute_priority(finding, risky_role, scoped, second_pass=True)
-        if priority.value > highest.value:
-            highest = priority
-    return highest
+    return score_findings_for_scope(risky_role.findings, risky_role, scoped, second_pass=True)
 
 
 def find_risky_rolebindings_or_clusterrolebindings(risky_roles, rolebindings, kind, ctx=None):
@@ -396,13 +395,14 @@ def find_risky_rolebindings_or_clusterrolebindings(risky_roles, rolebindings, ki
     for rolebinding in rolebindings:
         risky_role = get_role_referenced_by_binding(risky_roles, rolebinding)
         if risky_role is not None:
+            findings = findings_for_binding(risky_role, rolebinding, kind, ctx)
             risky_rolebindings.append(RoleBinding(rolebinding.metadata.name,
-                                                  priority_for_binding(risky_role, rolebinding,
-                                                                       kind, ctx),
+                                                  highest_priority(findings),
                                                   namespace=rolebinding.metadata.namespace,
                                                   kind=kind, subjects=rolebinding.subjects,
                                                   time=rolebinding.metadata.creation_timestamp,
-                                                  role_ref=risky_role))
+                                                  role_ref=risky_role,
+                                                  findings=findings))
     return risky_rolebindings
 
 

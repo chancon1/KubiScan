@@ -13,7 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from engine.finding import Finding  # noqa: E402
 from engine.priority import Priority  # noqa: E402
 from engine.scan_context import BoundBinding, ScanContext  # noqa: E402
-from engine.scoring import score_finding  # noqa: E402
+from engine.scoring import (MODIFIER_ORDER, score_finding,  # noqa: E402
+                            score_findings_for_scope)
 from engine.utils import are_rules_contain_other_rules  # noqa: E402
 from misc.constants import (CLUSTER_ROLE_BINDING_KIND, CLUSTER_ROLE_KIND,  # noqa: E402
                             ROLE_BINDING_KIND, ROLE_KIND)
@@ -131,6 +132,71 @@ def test_modifiers(report):
                'got {0} {1}'.format(priority.name, modifiers))
 
 
+def test_binding_scope_is_explained_and_isolated(report):
+    """A binding reports its own verdict, its own reason, and nothing else's.
+
+    The binding report is the only place that says which binding made a role
+    critical, so an empty explanation there sends a reader back to the cluster.
+    And because a ClusterRole reached by both a ClusterRoleBinding and a
+    RoleBinding is two grants of different severity, scoring one binding must
+    leave the role-level finding - the worst case - untouched.
+    """
+    rules = [rule(['rbac.authorization.k8s.io'], ['clusterrolebindings'], ['create'])]
+    ctx = context({CR_KEY: [CRB, RB_PLAIN]})
+    pattern = next(p for p in STATIC_RISKY_ROLES
+                   if p.name == 'risky-clusterrolebindings-write')
+    finding = Finding(pattern, are_rules_contain_other_rules(rules, pattern.rules))
+    score_finding(finding, CR, ctx, second_pass=True)
+
+    scoped = score_findings_for_scope([finding], CR, ctx.scoped_to(RB_PLAIN),
+                                      second_pass=True)
+    rendered = scoped[0].render()
+
+    report('a binding is scored in its own scope, not the role\'s',
+           scoped[0].priority == Priority.HIGH
+           and [m.name for m in scoped[0].modifiers] == ['namespacedBindingOnly'],
+           'got {0} {1}'.format(scoped[0].priority.name,
+                                [m.name for m in scoped[0].modifiers]))
+    report('a binding explains its verdict in one line',
+           rendered.count('\n') == 0
+           and pattern.name in rendered
+           and 'CRITICAL -> HIGH' in rendered
+           and rendered.endswith('(namespacedBindingOnly)'),
+           'rendered as: ' + rendered.replace('\n', ' | '))
+    report('--explain brings back the matched rules',
+           'clusterrolebindings: create' in scoped[0].render_verbose(),
+           'rendered as: ' + scoped[0].render_verbose().replace('\n', ' | '))
+    report('scoring a binding leaves the role-level finding alone',
+           finding.priority == Priority.CRITICAL
+           and [m.name for m in finding.modifiers] == ['clusterWide'],
+           'role-level became {0} {1}'.format(finding.priority.name,
+                                              [m.name for m in finding.modifiers]))
+
+
+def test_report_vocabulary_is_ascii(report):
+    """Every string a report can emit stays ASCII.
+
+    The findings are shipped to Splunk by a log collector, and a stray non-ASCII
+    character in a pattern name, a category or a modifier explanation is the
+    kind of thing that breaks a parser long after the scan looked fine.
+    """
+    strings = []
+    for pattern in STATIC_RISKY_ROLES:
+        strings += [pattern.name, pattern.category or '']
+    strings += MODIFIER_ORDER
+    strings += [p.name for p in Priority]
+
+    ctx = context({CR_KEY: [CRB_EVERYONE]})
+    pattern = next(p for p in STATIC_RISKY_ROLES if p.name == 'risky-secrets-read')
+    finding = Finding(pattern, are_rules_contain_other_rules(SECRETS_READ, pattern.rules))
+    score_finding(finding, CR, ctx, second_pass=True)
+    strings.append(finding.render())
+
+    offenders = [s for s in strings if any(ord(c) > 127 for c in s)]
+    report('every string a report can emit is ASCII',
+           not offenders, 'non-ASCII in: ' + ', '.join(offenders[:5]))
+
+
 def test_first_pass_defers_service_account_modifier(report):
     """Pass one must not use the map pass two builds from its own result."""
     ctx = context({ROLE_PLAIN_KEY: [RB_PLAIN]}, {'plain-ns': set(['sa', 'other'])})
@@ -141,4 +207,7 @@ def test_first_pass_defers_service_account_modifier(report):
            'got {0} {1}'.format(priority.name, modifiers))
 
 
-TESTS = [test_modifiers, test_first_pass_defers_service_account_modifier]
+TESTS = [test_modifiers,
+         test_binding_scope_is_explained_and_isolated,
+         test_report_vocabulary_is_ascii,
+         test_first_pass_defers_service_account_modifier]

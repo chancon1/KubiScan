@@ -15,7 +15,7 @@ from api.api_client import api_init, running_in_container
 from api.client_factory import ApiClientFactory
 from api.config import set_api_client, Config
 from engine.scan_context import configure_sensitive_namespaces
-from engine.finding import format_api_group
+from engine.finding import configure_explain, format_api_group
 
 json_filename = ""
 output_file = ""
@@ -477,7 +477,9 @@ def get_pretty_rules(rules):
                 resources_string = resources_string[:-1]
             resources_string += ')\n'
             pretty += groups_string + verbs_string + resources_string
-    return pretty
+    # The trailing newline of the last rule renders as an empty line in the
+    # table and as a stray blank field line in the JSON events.
+    return pretty.rstrip('\n')
 
 def print_rolebinding_rules(rolebinding_name, namespace):
     role = engine.utils.get_rolebinding_role(rolebinding_name, namespace)
@@ -764,6 +766,9 @@ Requirements:
     helper_switches.add_argument('-nc', '--no-color', action='store_true', help='Print without color')
     helper_switches.add_argument('--include-system', action='store_true',
                                  help='Include system roles (system:*) in output. They are excluded by default.')
+    helper_switches.add_argument('--explain', action='store_true',
+                                 help='Spell out every finding: the matched rules and one line\n'
+                                      'per context modifier. By default a finding is one line.')
     helper_switches.add_argument('--sensitive-namespaces', metavar='NS[,NS...]',
                                  help='Replace the sensitive-namespace list from sensitive_namespaces.yaml.\n'
                                       'A finding landing in one of these is raised by one level.')
@@ -828,6 +833,8 @@ Requirements:
         api_init(kube_config_file=args.kube_config, host=args.host, token_filename=args.token_filename, cert_filename=args.cert_filename, context=args.context)
     
     set_api_client(api_client)
+
+    configure_explain(args.explain)
 
     if args.sensitive_namespaces or args.sensitive_namespaces_add:
         def split(value):
@@ -932,6 +939,13 @@ def print_table_aligned_left(table):
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
         for row in table._rows:
             row[0] = ansi_escape.sub('', row[0])
+
+    # Cap the free-text columns. Unwrapped, 'Bound Service Accounts' alone pushed
+    # the table past 250 characters, and a table wider than the terminal is not a
+    # table any more. The JSON export above already ran, so it keeps the full text.
+    for column in ('Rules', 'Triggered By', 'Bound Service Accounts'):
+        if column in table.field_names:
+            table.max_width[column] = 55
 
     table.align = 'l'
     print(table)
