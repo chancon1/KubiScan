@@ -20,10 +20,15 @@ The tool was published as part of the "Securing Kubernetes Clusters by Eliminati
     - [From a remote with ServiceAccount token](#from-a-remote-with-serviceaccount-token)
   - [Scanning a static manifest dump](#scanning-a-static-manifest-dump)
 - [Reading the report](#reading-the-report)
+- [How a priority is decided](#how-a-priority-is-decided)
+  - [The seven context modifiers](#the-seven-context-modifiers)
+  - [Aggregation: always the maximum, never a sum](#aggregation-always-the-maximum-never-a-sum)
+  - [Sensitive namespaces](#sensitive-namespaces)
 - [Running as an in-cluster Job](#running-as-an-in-cluster-job)
 - [Examples](#examples)
 - [Demo](#demo)
 - [Risky Roles YAML](#risky-roles-yaml)
+- [Tests](#tests)
 - [Showcase](#%EF%B8%8F-showcase)
 - [License](#license)
 - [References](#references)
@@ -36,6 +41,7 @@ This can be especially helpful on large environments where there are lots of per
 KubiScan gathers information about risky roles\clusterroles, rolebindings\clusterrolebindings, users and pods, automating traditional manual processes and giving administrators the visibility they need to reduce risk.  
 
 ## What can it do? 
+-	Score every finding by the context it was granted in, not by a constant attached to the permission - see [How a priority is decided](#how-a-priority-is-decided)
 -	Identify risky Roles\ClusterRoles
 -	Identify risky RoleBindings\ClusterRoleBindings
 -	Identify risky Subjects (Users, Groups and ServiceAccounts)
@@ -203,15 +209,37 @@ same resource name can exist in several groups: `[core] secrets` are Kubernetes 
 while `[vault.example.com] secrets` is an unrelated custom resource that merely shares
 the name.
 
-**Triggered By** names the pattern from `risky_roles.yaml` that matched, and under it the
-concrete permission responsible:
+**Triggered By** carries one line per matched pattern: what fired, what it scored, and
+what made it that severe.
 
 ```
-risky-secrets
-  [core] secrets: get,list,delete
+risky-secrets-read: HIGH -> CRITICAL (clusterWide, boundToEveryone: system:authenticated)
+risky-configmaps-read: MEDIUM -> HIGH (clusterWide)
+risky-events-write: LOW -> MEDIUM (clusterWide)
 ```
 
-This makes it possible to tell a real finding from a coincidence without opening the role.
+Read a line as three parts:
+
+- **the pattern** from `risky_roles.yaml` that matched - `risky-secrets-read`;
+- **the score** - `HIGH -> CRITICAL` means the permission is worth HIGH on its own and the
+  context pushed it to CRITICAL. A single level (`CRITICAL`) means nothing moved it;
+- **the reasons in brackets** - the context modifiers that fired, with the detail that is
+  not already obvious from their name. Nothing in brackets means the pattern scored at its
+  base.
+
+The number of lines is not a severity: six lines are six distinct permissions, not
+something six times worse. The role's own `Priority` is the highest line, never a sum -
+see [How a priority is decided](#how-a-priority-is-decided).
+
+Pass `--explain` to expand every line into the full block - the rules that matched, and
+one line per modifier with its delta and a sentence of reasoning:
+
+```
+risky-secrets-read  HIGH -> CRITICAL
+  [core] secrets: get,list
+  +1 clusterWide (cluster-wide via ClusterRoleBinding: too-open)
+  +1 boundToEveryone (granted to system:authenticated)
+```
 
 **Bound Service Accounts** lists the subjects the role is granted to. Users and Groups are
 included alongside service accounts, since a risky role bound to a group such as
@@ -227,6 +255,84 @@ Roles whose name starts with `system:` are excluded from the Role\ClusterRole re
 (`-rr`, `-rcr`, `-rar`) by default - they are shipped by Kubernetes and dominate the
 output. Add `--include-system` to see them. The filter does not currently apply to the
 binding, subject or pod reports, and is ignored by `-a`.
+
+## How a priority is decided
+
+A permission is not dangerous in the abstract. "Read secrets" granted to one service
+account in one team namespace is a fact of life; the same rule on a ClusterRole bound to
+`system:authenticated` means every user of the cluster reads every secret. KubiScan scores
+the second one higher than the first, and says why.
+
+Each pattern in `risky_roles.yaml` declares a **base priority**: what the permission is
+worth in the plain case - a namespaced Role, bound, in an unremarkable namespace. Seven
+**context modifiers** then move it, each by one level, and the result is clamped to
+LOW..CRITICAL.
+
+```
+finding = base priority  +/-  the modifiers that apply   (clamped to LOW..CRITICAL)
+```
+
+A finding never decays to nothing. Context can say "not urgent", but the permission is
+still there and still appears in the report - at LOW if everything argued against it.
+
+### The seven context modifiers
+
+| Modifier | Fires when | Effect |
+|---|---|---|
+| `clusterWide` | A ClusterRoleBinding grants the ClusterRole, so the permission covers every namespace | +1 |
+| `namespacedBindingOnly` | Only RoleBindings reference the ClusterRole. Binding a ClusterRole with a RoleBinding grants its namespaced rules inside that one namespace, so its **cluster-scoped** rules never take effect | -1 |
+| `sensitiveNamespace` | The grant lands in a namespace listed in `sensitive_namespaces.yaml`. Not applied on top of `clusterWide`, which already covers every namespace there is | +1 |
+| `boundToEveryone` | A binding hands the role to `system:authenticated` or `system:unauthenticated` | +1 |
+| `privilegedSaReachable` | The permission can run a workload in a namespace that hosts an already-critical service account. Creating a Pod lets you name any service account of that namespace as its identity | +1 |
+| `resourceNamesRestricted` | Every matched rule is pinned to named objects, on verbs RBAC actually narrows by name. `create`, `list`, `watch` and `deletecollection` are never narrowed, so mixing one of those in earns no discount | -1 |
+| `unbound` | No RoleBinding or ClusterRoleBinding references the role. A latent risk, not an active one | -1 |
+
+Not every pattern carries all seven. The set is chosen by the pattern's `profile`: recon
+permissions such as "list pods" only ever carry `unbound`, because almost every
+authenticated user already holds them through the built-in `system:basic-user`, and
+`clusterWide` would fire on every cluster in existence.
+
+`privilegedSaReachable` is the one modifier that depends on the scan's own result, so the
+scan runs in two passes: the first scores everything else, the map of already-critical
+service accounts is built from that result, and the second pass settles the findings that
+depend on it. The map is never consulted while it is being built.
+
+### Aggregation: always the maximum, never a sum
+
+Adding is confined to a single finding. Everywhere above it, the answer is the worst case:
+
+```
+finding        = base +/- its own modifiers        <- the only place anything is added
+role           = max(its findings)
+binding        = max(the role's findings, rescored for that one binding)
+subject        = max(the bindings it appears in)   (ServiceAccount, User, Group)
+container/pod  = max(the subjects whose token it mounts)
+```
+
+A role with three MEDIUM findings stays MEDIUM. The priority answers "how bad is the worst
+thing this grants", not "how many remarks does it have" - otherwise twenty harmless LOW
+permissions would outrank a single cluster-wide secret read.
+
+The binding line matters in practice. A ClusterRole reached by ten RoleBindings and one
+ClusterRoleBinding is CRITICAL as a role, but in the binding report (`-rb`, `-rcb`, `-rab`)
+the ten RoleBindings stay HIGH and the single ClusterRoleBinding is the CRITICAL one - so
+the report names the binding that has to be fixed.
+
+### Sensitive namespaces
+
+`sensitive_namespaces.yaml` ships the list that `sensitiveNamespace` uses: the Kubernetes
+control plane (`kube-system`, `kube-public`, `kube-node-lease`) plus common policy,
+ingress and infrastructure namespaces. Tune it to the cluster:
+
+```
+kubiscan -rar --sensitive-namespaces-add prod,payments      # extend the shipped list
+kubiscan -rar --sensitive-namespaces prod,payments          # replace it entirely
+```
+
+The namespace that counts is the one where the grant **applies**: a Role's own namespace
+when something is bound to it, and the namespace of each RoleBinding for a ClusterRole. An
+unbound role has no place of effect and earns no namespace bump - `unbound` applies
+instead.
 
 ## Running as an in-cluster Job
 
@@ -245,19 +351,23 @@ per finding** on stdout so a log collector can pick them up line by line:
 
 ```json
 {
-  "scan_timestamp": "2026-08-02T15:33:22Z",
+  "scan_timestamp": "2026-08-04T19:51:00Z",
   "scan_tool": "kubiscan",
   "section": "Risky Roles and ClusterRoles",
   "Priority": "CRITICAL",
   "Kind": "ClusterRole",
   "Namespace": null,
-  "Name": "escalation-role",
-  "Creation Time": "Sun Aug  2 15:07:32 2026 (0 days)",
-  "Rules": "[rbac.authorization.k8s.io] (create,update,bind,escalate)->(clusterroles)\n",
-  "Triggered By": "risky-clusterroles\n  [rbac.authorization.k8s.io] clusterroles: create,update,bind,escalate",
-  "Bound Service Accounts": ""
+  "Name": "mock-secrets-reader-everyone",
+  "Creation Time": "Tue Aug  4 19:47:06 2026 (0 days)",
+  "Rules": "[core] (get,list)->(secrets)",
+  "Triggered By": "risky-secrets-read: HIGH -> CRITICAL (clusterWide, boundToEveryone: system:authenticated)",
+  "Bound Service Accounts": "system:authenticated [Group] (via ClusterRoleBinding: mock-secrets-reader-everyone [ClusterRoleBinding name])"
 }
 ```
+
+`Rules`, `Triggered By` and `Bound Service Accounts` hold one entry per line, as `\n`
+inside the JSON string - the event itself is always a single line, so a log collector
+never has to stitch one back together.
 
 Each event carries the scan timestamp, the report section it came from, and the report
 columns as-is. The Job is annotated for Splunk (`splunk.com/index`,
@@ -277,28 +387,77 @@ A small example of KubiScan usage:
 <p><a href="https://cyberark.wistia.com/medias/0lt642okgn?wvideo=0lt642okgn"><img src="https://github.com/cyberark/KubiScan/blob/assets/kubiscan_embeded.png?raw=true" width="600"></a></p>
 
 ## Risky Roles YAML
-There is a file named `risky_roles.yaml`. This file contains templates for risky roles with priority.    
-Although the kind in each role is `Role`, these templates will be compared against any Role\ClusterRole in the cluster.  
-When each of these roles is checked against a role in the cluster, it checks if the role in the cluster contains the rules from the risky role. If it does, it will be marked as risky.  
-We added all the roles we found to be risky, but because each one can define the term "risky" in a different way, you can modify the file by adding\removing roles you think are more\less risky.  
+`risky_roles.yaml` holds the matrix: 170 patterns across 10 categories, each a template of
+rules that is compared against every Role and ClusterRole in the cluster. A role matching a
+pattern's rules is reported. Each of us defines "risky" differently, so the file is meant
+to be edited - add, remove or re-rank patterns to match your policy.
+
+A pattern is described by:
+
+| Field | Meaning |
+|---|---|
+| `name` | identifier shown in the report |
+| `priority` | **base** score - what the permission is worth in the plain namespaced case, before context |
+| `scope` | `namespaced` (default) or `cluster`, see below |
+| `appliesTo` | `[Role, ClusterRole]` unless narrowed; usually left implicit, `scope` covers it |
+| `profile` | named set of context modifiers from the `profiles:` block at the top of the file |
+| `modifiers` | inline overrides merged on top of the profile |
+| `category` | grouping, e.g. `privilege-escalation`, `credential-access`, `recon` |
+| `matchesAnyApiGroup` | "total control of whichever group this is", as opposed to `apiGroups: ["*"]` |
 
 ### How a pattern is matched
-A cluster role matches a pattern when all three parts of a rule line up:
 
-- **apiGroups** - at least one group of the pattern must be covered by the rule. Use `""`
-  for the core group. A pattern using `"*"` disables the check entirely, so an unrelated
-  custom resource sharing a name (`secrets` under a vendor group, say) would match a
-  Kubernetes-native pattern. Only `risky-wildcard-all` should use `"*"`.
-- **resources** - every resource named by the pattern must be present, unless the rule
-  grants `*`.
-- **verbs** - matching is **OR**-based: holding **any one** of the listed verbs is enough.
-  So `risky-secrets`, which lists `get, list, watch, create, update, patch, delete`,
-  fires on a plain `get`.
+Matching is context-free: the same role yields the same findings however it is bound.
+Turning those findings into severities is the [scoring model's](#how-a-priority-is-decided)
+job, and it needs the whole cluster to do it.
 
-Roles are checked against every pattern, so one role can be reported with several entries
-under `Triggered By`; its priority is the highest among them. The only exception is
-`risky-wildcard-all` (`*`/`*`/`*`), which subsumes everything more specific and is reported
-on its own.
+A role matches a pattern when everything lines up:
+
+- **scope** - a pattern marked `scope: cluster` names a resource that lives outside any
+  namespace (`nodes`, `clusterroles`, `persistentvolumes`). A namespaced Role can never
+  grant it, so such patterns are not even evaluated against one. A Role with
+  `get nodes/proxy` grants nothing and is not reported.
+- **rules of a pattern are AND-ed** - a pattern holding two rules matches only when both
+  are satisfied, possibly by two different rules of the role. That is what makes the
+  escalation-chain patterns work: half a chain is not a chain.
+- **resources inside one rule are also AND-ed** - a rule listing
+  `["certificates", "certificaterequests"]` only matches a role holding both. Write one
+  pattern per resource unless you really mean the conjunction.
+- **verbs are OR-ed** - holding **any one** of the listed verbs is enough, so
+  `risky-secrets-read` fires on a plain `get`.
+- **apiGroups must name the group the resource really lives in** - `""` for the core
+  group. `[core] secrets` is a Kubernetes Secret; `[vault.example.com] secrets` is an
+  unrelated custom resource that merely shares the name, and it does not match the
+  Kubernetes-native pattern.
+
+Two spellings of a wildcard mean different things, and the difference is deliberate:
+
+| In a pattern | Means | Satisfied by |
+|---|---|---|
+| `apiGroups: ["*"]` | group-unrestricted access | only a rule that also says `"*"` |
+| `matchesAnyApiGroup: true` | total control of whichever single group this is | `apiGroups: [x], resources: ["*"]` for any `x` |
+
+Without that split the wildcard patterns swallowed real findings such as
+`apiGroups: [constraints.gatekeeper.sh], resources: ["*"]`. A pattern verb of `"*"` works
+the same way: it asks for unrestricted verb access, and only a rule that also says `"*"`
+provides it.
+
+One role can match several patterns and is then reported with several lines under
+`Triggered By`. The exception is a role holding a full wildcard (`*`/`*`/`*`): it subsumes
+everything more specific, so it collapses into a single finding instead of the whole
+matrix.
+
+## Tests
+
+```bash
+python tests/run_all.py
+```
+
+No cluster needed - the guards run against `risky_roles.yaml` and the scoring engine
+directly. `tests/fixtures/detected_permissions.txt` baselines every permission the matrix
+can detect, so a verb quietly disappearing from a pattern shows up in review as a deleted
+line rather than as silence. See `tests/README.md` for what each check is for and which
+traps this codebase has already fallen into.
 
 ## ❤️ Showcase  
 * Presented at RSA 2020 ["Compromising Kubernetes Cluster by Exploiting RBAC Permissions"](https://www.youtube.com/watch?v=1LMo0CftVC4)
