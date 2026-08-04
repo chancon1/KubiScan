@@ -39,8 +39,9 @@ tmp_*
 *.bak
 *.orig
 
-# Container and deployment definitions are not needed at runtime
-Dockerfile*
-DockerHubDockerfile*
+# Container and deployment definitions are not needed at runtime.
+# The Dockerfiles are deliberately NOT excluded: 'minikube image build' and other
+# builders that read the Dockerfile out of the transferred context fail outright
+# when it is missing, and the files cost a few kilobytes.
 .dockerignore
 deploy
