@@ -59,6 +59,24 @@ permission was actually granted, not by a constant attached to the pattern.
   every string a report can emit - pattern names, categories, modifier names
   and their explanations - must stay ASCII, since the findings are parsed
   downstream by a log collector.
+- Reproducible live-cluster validation artifacts under
+  `artifacts/live-cluster-2026-08-06`: mock RBAC, nginx workload and Ingress,
+  in-cluster Job manifest, full 471-event JSON report, and an execution summary.
+  The Job completed successfully and every stdout line parsed as one schema-v2
+  event without an embedded cluster-name field.
+
+### Known limitations
+- Schema v2 emits one event per matched pattern and concrete binding, then sends
+  the full snapshot on every Job run. The live test showed 471 events from only
+  59 risky roles, including 224 Kyverno events. The documented follow-up is one
+  compact event per resolved Role+Binding, full findings kept as structured
+  evidence, change-only lifecycle emission, and a separate scan summary.
+- Kubernetes ClusterRole aggregation is not resolved before event generation.
+  Aggregated component roles can therefore appear as separate `LATENT` events
+  while their rules also appear in the bound parent role.
+- Potential impact and review urgency are both represented by `Priority` today.
+  The follow-up design separates technical `Severity` from context/baseline-aware
+  review `Priority`; this has not yet changed the schema or scorer.
 
 ### Changed
 - The in-cluster Job now emits one JSON object per binding-centred risk event.

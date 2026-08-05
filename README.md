@@ -26,6 +26,7 @@ The tool was published as part of the "Securing Kubernetes Clusters by Eliminati
   - [Aggregation: always the maximum, never a sum](#aggregation-always-the-maximum-never-a-sum)
   - [Sensitive namespaces](#sensitive-namespaces)
 - [Running as an in-cluster Job](#running-as-an-in-cluster-job)
+- [Live-cluster validation](#live-cluster-validation)
 - [Examples](#examples)
 - [Demo](#demo)
 - [Risky Roles YAML](#risky-roles-yaml)
@@ -56,7 +57,8 @@ KubiScan gathers information about risky roles\clusterroles, rolebindings\cluste
 - CVE scan
 - EKS\AKS\GKE support
 - Scan an offline dump of manifests instead of a live cluster
-- Run as an in-cluster Job and emit one JSON event per risky grant for log collectors
+- Run as an in-cluster Job and emit one JSON event per risky pattern and concrete grant
+  for log collectors
 
 ## Usage
 ### Container
@@ -297,6 +299,14 @@ Each event answers the questions needed for review without printing the whole ro
 `LATENT` means either that the role is unbound or that the binding has no subjects. The
 normal Role/ClusterRole and binding reports remain available and keep their old schema.
 
+Schema v2 is deliberately pattern-granular: a role that matches 20 patterns through one
+binding emits 20 events, and the Job emits the complete snapshot on every run. This gives
+precise evidence but can create high event volume in operator-heavy clusters. The
+[live-cluster validation](#live-cluster-validation) measured this effect. Grant-level
+aggregation, ClusterRole `aggregationRule` resolution, separate impact/review priority,
+and change-only emission are documented there as the next design iteration; they are not
+implemented in schema v2.
+
 System filtering is deliberately grant-aware in this view. Kubernetes' own `system:*`
 role plus `system:*` binding pairs are hidden by default, but a custom binding to a
 `system:*` role stays visible because it is a deliberate grant. `--include-system`
@@ -444,6 +454,63 @@ The entrypoint defaults to the event schema. Set `KUBISCAN_REPORT_MODE=roles` to
 to the legacy role-centred JSON without changing the image.
 
 To scan on a schedule, wrap the Job in a CronJob or let your GitOps tooling re-apply it.
+
+## Live-cluster validation
+
+The event pipeline was exercised end to end on Kubernetes v1.36.1 in Docker Desktop on
+2026-08-06. The test installed Kyverno, ingress-nginx, cert-manager, an nginx workload,
+and the Cilium operator/RBAC resources, then added deliberately risky mock accounts,
+roles and bindings. The current branch was built as a local image and executed through
+an in-cluster Job, not only through the host CLI.
+
+The Job completed in six seconds and wrote 471 valid JSON lines. Every line parsed as a
+schema-v2 `rbac_risk` event, all 471 IDs were non-empty and unique, and no event contained
+a cluster-name field. The collector is expected to add cluster context externally.
+
+| Result | Count |
+|---|---:|
+| `CRITICAL` | 104 |
+| `HIGH` | 99 |
+| `MEDIUM` | 98 |
+| `LOW` | 170 |
+| `ACTIVE` | 252 |
+| `LATENT` | 219 |
+
+The broad mock grant to `system:authenticated` sorted first, followed by other active
+cluster-wide risks; the unbound mock Pod creator sorted as `MEDIUM/LATENT`. The nginx
+deployment reached 1/1 ready and its test Ingress returned HTTP 200.
+
+The run also exposed an important scale limit. Only 59 risky roles produced 471 events:
+Kyverno accounted for 224 pattern events, while the built-in `admin` and `edit` roles
+produced 64 and 49 latent events. Grouping the exact same result by resolved
+`Role + Binding` would produce 62 grant records, of which 40 are active and have at least
+one HIGH or CRITICAL finding. In addition, Kubernetes aggregated ClusterRoles currently
+appear both as rules in their parent and as separate latent definitions; resolving
+`aggregationRule` before event generation would remove that duplication.
+
+The proposed follow-up schema therefore keeps full findings as structured `Evidence` but
+renders one compact event per resolved grant. Its technical `Severity` is the strongest
+attack path; its review `Priority` additionally considers subject exposure, scope,
+new/changed state, constraints and an explicitly approved baseline. Risk count does not
+raise severity by itself. Subsequent scheduled scans should emit lifecycle changes
+(`new`, `changed`, `risk_increased`, `resolved`) plus one scan summary instead of sending
+an unchanged full snapshot. This follow-up is design guidance from the validation and is
+not yet implemented.
+
+Docker Desktop's existing network and non-shared `/sys/fs/bpf` mount prevented a safe
+Cilium datapath takeover. The test therefore kept Docker Desktop's CNI and ran Cilium in
+controller/RBAC compatibility mode with CNI installation, policy enforcement, Envoy and
+the unmanaged-pod restarter disabled. This limitation is recorded explicitly rather than
+claiming a full Cilium networking test.
+
+Reproducible manifests, the full report and the detailed test notes are under
+[`artifacts/live-cluster-2026-08-06`](artifacts/live-cluster-2026-08-06/):
+
+- [`live-test-summary.md`](artifacts/live-cluster-2026-08-06/live-test-summary.md)
+- [`kubiscan-rbac-events-final.json`](artifacts/live-cluster-2026-08-06/kubiscan-rbac-events-final.json)
+- [`mock-rbac.yaml`](artifacts/live-cluster-2026-08-06/mock-rbac.yaml)
+- [`nginx-demo.yaml`](artifacts/live-cluster-2026-08-06/nginx-demo.yaml)
+- [`kubiscan-live-job.yaml`](artifacts/live-cluster-2026-08-06/kubiscan-live-job.yaml)
 
 ## Examples  
 To see all the examples, run `python3 KubiScan.py -e` or from within the container `kubiscan -e`.  
