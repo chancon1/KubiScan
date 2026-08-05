@@ -17,7 +17,7 @@ class RiskyPattern:
 
     def __init__(self, name, base_priority, rules, resource_scope=NAMESPACED_SCOPE,
                  applies_to=None, modifiers=None, category=None, description=None,
-                 any_api_group=False):
+                 summary=None, impact=None, any_api_group=False):
         self.name = name
         self.base_priority = base_priority
         self.rules = rules
@@ -26,6 +26,13 @@ class RiskyPattern:
         self.modifiers = modifiers or {}
         self.category = category
         self.description = description
+        # Optional report vocabulary. ``summary`` is a short verb phrase such
+        # as "read Kubernetes Secrets"; ``impact`` says what the permission
+        # makes possible. Patterns without either field still produce a useful
+        # event from their matched rules, which lets the matrix migrate without
+        # making all 170 entries change at once.
+        self.summary = summary
+        self.impact = impact
         self.any_api_group = any_api_group
 
     @property

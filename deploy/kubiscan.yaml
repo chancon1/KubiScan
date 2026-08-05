@@ -73,6 +73,9 @@ spec:
         - name: kubiscan
           image: chancon17/kubiscan:v2
           imagePullPolicy: Always
+          env:
+            - name: KUBISCAN_REPORT_MODE
+              value: events
           securityContext:
             runAsNonRoot: true
             runAsUser: 3456

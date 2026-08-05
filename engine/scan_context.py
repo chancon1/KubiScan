@@ -53,11 +53,12 @@ def effective_sensitive_namespaces():
 class BoundBinding:
     """A RoleBinding or ClusterRoleBinding pointing at a role we scanned."""
 
-    def __init__(self, kind, name, namespace, subjects):
+    def __init__(self, kind, name, namespace, subjects, time=None):
         self.kind = kind
         self.name = name
         self.namespace = namespace
         self.subjects = subjects or []
+        self.time = time
 
     @property
     def is_cluster_wide(self):
@@ -108,7 +109,7 @@ class ScanContext:
             key = self._key(ref.kind or ROLE_KIND, ref.name, rb.metadata.namespace)
             self._index.setdefault(key, []).append(
                 BoundBinding(ROLE_BINDING_KIND, rb.metadata.name, rb.metadata.namespace,
-                             rb.subjects))
+                             rb.subjects, rb.metadata.creation_timestamp))
 
         for crb in cluster_role_bindings or []:
             ref = crb.role_ref
@@ -117,7 +118,8 @@ class ScanContext:
             # A ClusterRoleBinding can only reference a ClusterRole.
             key = self._key(CLUSTER_ROLE_KIND, ref.name, None)
             self._index.setdefault(key, []).append(
-                BoundBinding(CLUSTER_ROLE_BINDING_KIND, crb.metadata.name, None, crb.subjects))
+                BoundBinding(CLUSTER_ROLE_BINDING_KIND, crb.metadata.name, None, crb.subjects,
+                             crb.metadata.creation_timestamp))
 
     def bindings_for(self, role):
         return self._index.get(self._key(role.kind, role.name, role.namespace), [])
@@ -209,6 +211,15 @@ class ScanContext:
         """
         return SingleBindingContext(self, binding)
 
+    def without_bindings(self):
+        """A view in which the role has no effective grant.
+
+        Used for a RoleBinding/ClusterRoleBinding whose subjects list is empty.
+        Such an object exists, but Kubernetes grants its role to nobody, so it
+        must score like a latent role rather than an active cluster-wide grant.
+        """
+        return NoBindingContext(self)
+
     def reaches_privileged_sa(self, role):
         """Can this grant borrow an identity better than the one it already has?
 
@@ -263,3 +274,17 @@ class SingleBindingContext(ScanContext):
 
     def bindings_for(self, role):
         return [self._binding]
+
+
+class NoBindingContext(SingleBindingContext):
+    """Shared scan context with an intentionally empty binding lookup."""
+
+    def __init__(self, parent):
+        self.sensitive_namespaces = parent.sensitive_namespaces
+        self._index = parent._index
+        self.privileged_service_accounts = parent.privileged_service_accounts
+        self.privileged_sa_known = parent.privileged_sa_known
+        self._binding = None
+
+    def bindings_for(self, role):
+        return []

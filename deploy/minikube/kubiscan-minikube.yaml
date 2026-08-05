@@ -88,10 +88,10 @@ spec:
           EOF
           export KUBECONFIG=/tmp/kubeconfig
           python3 /opt/kubiscan/KubiScan.py \
+            -q \
             -co /tmp/kubeconfig \
             -ctx in-cluster \
-            -rar \
-            -r \
+            --risk-events \
             -j /tmp/report.json
           echo "JSON_REPORT_BEGIN"
           cat /tmp/report.json

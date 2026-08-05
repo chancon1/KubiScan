@@ -10,6 +10,10 @@ python3 KubiScan.py -rr -lt 100
 # With rules
 python3 KubiScan.py -rr -r
 
+# One binding-centred event per risky grant (recommended for Splunk)
+python3 KubiScan.py --risk-events
+python3 KubiScan.py --risk-events -j report.json
+
 # From remote
 # kubiscan -ho <master_ip:master_port> -t <token_filename> -c <certificate_filename> -rr
 SERVICE_TOKEN_FILENAME="/var/run/secrets/kubernetes.io/serviceaccount/token"

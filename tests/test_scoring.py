@@ -182,7 +182,8 @@ def test_report_vocabulary_is_ascii(report):
     """
     strings = []
     for pattern in STATIC_RISKY_ROLES:
-        strings += [pattern.name, pattern.category or '']
+        strings += [pattern.name, pattern.category or '', pattern.summary or '',
+                    pattern.description or '', pattern.impact or '']
     strings += MODIFIER_ORDER
     strings += [p.name for p in Priority]
 

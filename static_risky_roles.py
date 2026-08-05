@@ -62,6 +62,9 @@ def set_risky_roles_from_yaml(items, profiles=None):
             applies_to=applies_to,
             modifiers=_resolve_modifiers(metadata, profiles),
             category=metadata.get('category'),
+            description=metadata.get('description'),
+            summary=metadata.get('summary'),
+            impact=metadata.get('impact'),
             any_api_group=any_api_group,
         ))
 

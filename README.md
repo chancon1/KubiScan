@@ -20,6 +20,7 @@ The tool was published as part of the "Securing Kubernetes Clusters by Eliminati
     - [From a remote with ServiceAccount token](#from-a-remote-with-serviceaccount-token)
   - [Scanning a static manifest dump](#scanning-a-static-manifest-dump)
 - [Reading the report](#reading-the-report)
+  - [Binding-centred risk events](#binding-centred-risk-events)
 - [How a priority is decided](#how-a-priority-is-decided)
   - [The seven context modifiers](#the-seven-context-modifiers)
   - [Aggregation: always the maximum, never a sum](#aggregation-always-the-maximum-never-a-sum)
@@ -55,7 +56,7 @@ KubiScan gathers information about risky roles\clusterroles, rolebindings\cluste
 - CVE scan
 - EKS\AKS\GKE support
 - Scan an offline dump of manifests instead of a live cluster
-- Run as an in-cluster Job and emit one JSON event per finding for log collectors
+- Run as an in-cluster Job and emit one JSON event per risky grant for log collectors
 
 ## Usage
 ### Container
@@ -251,10 +252,55 @@ system:authenticated [Group] (via ClusterRoleBinding: too-open [ClusterRoleBindi
 ```
 
 ### Built-in system roles
-Roles whose name starts with `system:` are excluded from the Role\ClusterRole reports
-(`-rr`, `-rcr`, `-rar`) by default - they are shipped by Kubernetes and dominate the
-output. Add `--include-system` to see them. The filter does not currently apply to the
-binding, subject or pod reports, and is ignored by `-a`.
+Kubernetes-provided `system:*` objects dominate an unfiltered report. By default the role
+reports hide `system:*` roles, the binding reports hide `system:*` bindings, and the
+subject report hides a subject whose risk comes only from `system:*` roles. A custom
+binding to a built-in role remains visible in the binding report. Add `--include-system`
+to restore these objects. Pod/container reporting is unchanged.
+
+### Binding-centred risk events
+
+`--risk-events` is the compact log-collector view. Instead of putting every finding and
+every binding of a role into one large record, it emits one event for one risky pattern
+through one concrete binding:
+
+```
+python3 KubiScan.py --risk-events
+python3 KubiScan.py --risk-events -j report.json
+```
+
+A ClusterRole referenced by a namespaced RoleBinding and a ClusterRoleBinding therefore
+becomes two events with different scopes and, when appropriate, different priorities.
+Each event answers the questions needed for review without printing the whole role:
+
+```json
+{
+  "Summary": "All authenticated users can read Kubernetes Secrets cluster-wide",
+  "Priority": "CRITICAL",
+  "Score": "HIGH -> CRITICAL",
+  "Status": "ACTIVE",
+  "Risk": "risky-secrets-read",
+  "Granted To": ["Group system:authenticated"],
+  "Permission": ["[core] secrets: get,list,watch"],
+  "Role": "ClusterRole secret-reader",
+  "Binding": "ClusterRoleBinding global-reader",
+  "Scope": "cluster-wide",
+  "Why": [
+    "Reading Secrets exposes the credentials and sensitive data stored in them.",
+    "Cluster-wide via ClusterRoleBinding: global-reader.",
+    "Granted to system:authenticated."
+  ]
+}
+```
+
+`ACTIVE` means a binding currently grants the permission to at least one subject.
+`LATENT` means either that the role is unbound or that the binding has no subjects. The
+normal Role/ClusterRole and binding reports remain available and keep their old schema.
+
+System filtering is deliberately grant-aware in this view. Kubernetes' own `system:*`
+role plus `system:*` binding pairs are hidden by default, but a custom binding to a
+`system:*` role stays visible because it is a deliberate grant. `--include-system`
+restores everything.
 
 ## How a priority is decided
 
@@ -346,36 +392,56 @@ kubectl -n kubiscan logs job/kubiscan-scan
 ```
 
 The container entry point (`entrypoint.sh`) builds a kubeconfig from the pod's service
-account token, runs `KubiScan.py -rar -r -j /tmp/report.json`, and prints **one JSON object
-per finding** on stdout so a log collector can pick them up line by line:
+account token, runs the binding-centred `--risk-events` report, and prints **one JSON
+object per event** on stdout so a log collector can pick them up line by line:
 
 ```json
 {
   "scan_timestamp": "2026-08-04T19:51:00Z",
   "scan_tool": "kubiscan",
-  "section": "Risky Roles and ClusterRoles",
+  "section": "RBAC Risk Events",
+  "schema_version": 2,
+  "event_type": "rbac_risk",
+  "event_id": "18bd6f3c6930a8556ac7a2a6bc3c50b665e87d1c8cd91b3f1ec582df943880da",
+  "Review Order": 1,
+  "Summary": "All authenticated users can read Kubernetes Secrets cluster-wide",
   "Priority": "CRITICAL",
-  "Kind": "ClusterRole",
-  "Namespace": null,
-  "Name": "mock-secrets-reader-everyone",
-  "Creation Time": "Tue Aug  4 19:47:06 2026 (0 days)",
-  "Rules": "[core] (get,list)->(secrets)",
-  "Triggered By": "risky-secrets-read: HIGH -> CRITICAL (clusterWide, boundToEveryone: system:authenticated)",
-  "Bound Service Accounts": "system:authenticated [Group] (via ClusterRoleBinding: mock-secrets-reader-everyone [ClusterRoleBinding name])"
+  "Score": "HIGH -> CRITICAL",
+  "Status": "ACTIVE",
+  "Risk": "risky-secrets-read",
+  "Granted To": ["Group system:authenticated"],
+  "Permission": ["[core] secrets: get,list,watch"],
+  "Role": "ClusterRole mock-secrets-reader-everyone",
+  "Binding": "ClusterRoleBinding too-open",
+  "Scope": "cluster-wide",
+  "Why": [
+    "Reading Secrets exposes the credentials and sensitive data stored in them.",
+    "Cluster-wide via ClusterRoleBinding: too-open.",
+    "Granted to system:authenticated."
+  ]
 }
 ```
 
-`Rules`, `Triggered By` and `Bound Service Accounts` hold one entry per line, as `\n`
-inside the JSON string - the event itself is always a single line, so a log collector
-never has to stitch one back together.
+The multivalue fields (`Granted To`, `Permission`, `Why`) remain JSON arrays, so Splunk
+can search an individual subject or permission without parsing display text. The event
+itself is always one JSON line, so a collector never has to stitch one back together.
 
 Each event carries the scan timestamp, the report section it came from, and the report
 columns as-is. The Job is annotated for Splunk (`splunk.com/index`,
 `splunk.com/sourcetype`); adjust or drop those annotations to suit your collector.
 
-The findings themselves carry no cluster identifier - a Kubernetes cluster has no canonical
-name, and the value is best added by the log collector, which already knows which cluster
-it runs in.
+`event_id` is a stable SHA-256 fingerprint of pattern, role and binding. It stays the same
+across scans so Splunk can track a grant whose priority changes. KubiScan deliberately does
+not add a cluster field: Fluent Bit or the Splunk agent should attach that deployment
+context. When correlating several clusters, use that external field together with
+`event_id` as the unique key.
+
+`Review Order` is calculated after sorting by priority, active/latent state, scope,
+sensitive namespace and subject exposure. It is intended as the default order inside one
+scan; `CRITICAL/ACTIVE` cluster-wide grants to broad groups come first.
+
+The entrypoint defaults to the event schema. Set `KUBISCAN_REPORT_MODE=roles` to roll back
+to the legacy role-centred JSON without changing the image.
 
 To scan on a schedule, wrap the Job in a CronJob or let your GitOps tooling re-apply it.
 
@@ -403,6 +469,9 @@ A pattern is described by:
 | `profile` | named set of context modifiers from the `profiles:` block at the top of the file |
 | `modifiers` | inline overrides merged on top of the profile |
 | `category` | grouping, e.g. `privilege-escalation`, `credential-access`, `recon` |
+| `summary` | optional short verb phrase used in a risk-event Summary, e.g. `read Kubernetes Secrets` |
+| `description` | optional first sentence of `Why`; the exact matched permission is the fallback |
+| `impact` | optional consequence shown after `description`; category text is the fallback |
 | `matchesAnyApiGroup` | "total control of whichever group this is", as opposed to `apiGroups: ["*"]` |
 
 ### How a pattern is matched

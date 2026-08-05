@@ -16,6 +16,7 @@ from api.client_factory import ApiClientFactory
 from api.config import set_api_client, Config
 from engine.scan_context import configure_sensitive_namespaces
 from engine.finding import configure_explain, format_api_group
+from engine.risk_event import build_risk_events
 
 json_filename = ""
 output_file = ""
@@ -96,6 +97,39 @@ def print_all_risky_roles(show_rules=False, days=None, priority=None, namespace=
     if priority:
         risky_any_roles = filter_objects_by_priority(priority, risky_any_roles)
     generic_print('|Risky Roles and ClusterRoles|', risky_any_roles, show_rules)
+
+
+def print_risk_events(include_system=False):
+    """Print/export one compact event per finding and concrete RBAC grant."""
+    risky_roles, ctx = engine.utils.scan_roles_and_clusterroles()
+    events = build_risk_events(risky_roles, ctx, include_system=include_system)
+
+    if json_filename:
+        export_risk_events_to_json(events, json_filename)
+
+    global curr_header
+    curr_header = '|RBAC Risk Events|'
+    columns = ['Priority', 'Score', 'Status', 'Summary', 'Risk', 'Granted To',
+               'Permission', 'Role', 'Binding', 'Scope', 'Why']
+    table = PrettyTable(columns)
+    table.hrules = ALL
+    for event in events:
+        table.add_row([
+            get_color_by_priority(event.priority) + event.priority.name + WHITE,
+            event.score,
+            event.status,
+            event.summary,
+            event.risk_name,
+            '\n'.join(event.subjects) or 'Nobody',
+            '\n'.join(event.permissions),
+            event.role,
+            event.binding,
+            event.scope,
+            '\n'.join(event.reasons),
+        ])
+    # Risk events have their own structured exporter. Running the legacy table
+    # exporter as well would flatten arrays and duplicate the section.
+    print_table_aligned_left(table, export_json=False)
 
 
 def print_risky_roles(show_rules=False, days=None, priority=None, namespace=None, include_system=False):
@@ -703,6 +737,9 @@ Requirements:
     opt.add_argument('-rr', '--risky-roles', action='store_true', help='Get all risky Roles (can be used with -r to view rules)', required=False)
     opt.add_argument('-rcr', '--risky-clusterroles', action='store_true', help='Get all risky ClusterRoles (can be used with -r to view rules)',required=False)
     opt.add_argument('-rar', '--risky-any-roles', action='store_true', help='Get all risky Roles and ClusterRoles', required=False)
+    opt.add_argument('--risk-events', action='store_true',
+                     help='Report one structured risk event per finding and concrete binding.',
+                     required=False)
 
     opt.add_argument('-rb', '--risky-rolebindings', action='store_true', help='Get all risky RoleBindings', required=False)
     opt.add_argument('-rcb', '--risky-clusterrolebindings', action='store_true',help='Get all risky ClusterRoleBindings', required=False)
@@ -850,6 +887,8 @@ Requirements:
         print_risky_clusterroles(show_rules=args.rules, days=args.less_than, priority=args.priority, namespace=args.namespace, include_system=args.include_system)
     if args.risky_any_roles:
         print_all_risky_roles(show_rules=args.rules, days=args.less_than, priority=args.priority, namespace=args.namespace, include_system=args.include_system)
+    if args.risk_events:
+        print_risk_events(include_system=args.include_system)
     if args.risky_rolebindings:
         print_risky_rolebindings(days=args.less_than, priority=args.priority, namespace=args.namespace, include_system=args.include_system)
     if args.risky_clusterrolebindings:
@@ -930,9 +969,9 @@ Requirements:
     elif args.clusterrolebinding_rules:
         print_clusterrolebinding_rules(args.clusterrolebinding_rules)
 
-def print_table_aligned_left(table):
+def print_table_aligned_left(table, export_json=True):
     global json_filename
-    if json_filename != "":
+    if export_json and json_filename != "":
         export_to_json(table, json_filename)
     global output_file
     if no_color:
@@ -943,13 +982,40 @@ def print_table_aligned_left(table):
     # Cap the free-text columns. Unwrapped, 'Bound Service Accounts' alone pushed
     # the table past 250 characters, and a table wider than the terminal is not a
     # table any more. The JSON export above already ran, so it keeps the full text.
-    for column in ('Rules', 'Triggered By', 'Bound Service Accounts'):
+    for column in ('Rules', 'Triggered By', 'Bound Service Accounts', 'Summary',
+                   'Granted To', 'Permission', 'Why'):
         if column in table.field_names:
             table.max_width[column] = 55
 
     table.align = 'l'
     print(table)
     print('\n')
+
+
+def export_risk_events_to_json(events, filename):
+    """Append a structured event section without routing it through a table."""
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    items = []
+    for review_order, event in enumerate(events, 1):
+        item = {
+            'scan_timestamp': timestamp,
+            'scan_tool': 'kubiscan',
+            'section': 'RBAC Risk Events',
+            'Review Order': review_order,
+        }
+        item.update(event.to_dict())
+        items.append(item)
+
+    try:
+        with open(filename, 'r') as json_file:
+            content = json_file.read()
+    except (IOError, OSError):
+        content = ''
+
+    existing = [] if not content.strip() else json.loads(content)
+    existing.append({'RBAC Risk Events': items})
+    with open(filename, 'w') as json_file:
+        json.dump(existing, json_file, indent=2)
 
 
 def export_to_json(table, json_filename):

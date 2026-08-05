@@ -40,6 +40,13 @@ mode that matters is a modifier firing slightly too often - severities inflate
 until the top of the report means nothing again, which is the problem the
 scoring model exists to fix.
 
+**`test_events`** locks the Splunk-facing schema to the grant that was actually
+made. It verifies that a ClusterRole reached by a RoleBinding and a
+ClusterRoleBinding becomes two differently-scored events, empty bindings are
+latent, broad groups sort first, event IDs stay stable, arrays remain structured
+in JSON, custom grants to `system:*` roles stay visible, and the complete static
+scan-to-export path produces valid schema-v2 records.
+
 ## Traps this codebase has already fallen into
 
 - **Several resources in one pattern rule behave as AND.** A rule listing

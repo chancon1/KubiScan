@@ -25,6 +25,9 @@
 #   profile     named set of context modifiers, see below
 #   modifiers   inline overrides merged on top of the profile
 #   category    grouping for reports and filtering
+#   summary     optional short verb phrase for risk events
+#   description optional explanation of why the permission is risky
+#   impact      optional consequence shown after the description
 #
 # MODIFIERS
 #
@@ -199,6 +202,9 @@ items:
 
 - metadata:
     name: risky-clusterrolebindings-write
+    summary: create or modify ClusterRoleBindings
+    description: Changing ClusterRoleBindings can grant roles across the entire cluster.
+    impact: Kubernetes prevents binding stronger roles unless the caller holds their permissions or has bind; review both permissions together.
     priority: CRITICAL
     scope: cluster
     profile: cluster-scoped
@@ -224,6 +230,9 @@ items:
 
 - metadata:
     name: risky-rolebindings-write
+    summary: create or modify RoleBindings
+    description: Changing RoleBindings can grant roles inside a namespace.
+    impact: Kubernetes prevents binding stronger roles unless the caller holds their permissions or has bind; review both permissions together.
     priority: CRITICAL
     profile: namespaced-escalation
     category: privilege-escalation
@@ -302,6 +311,9 @@ items:
 
 - metadata:
     name: risky-wildcard-all
+    summary: use unrestricted Kubernetes API permissions
+    description: Wildcards in apiGroups, resources and verbs grant unrestricted API access.
+    impact: A bound subject can take full control of the granted scope.
     priority: CRITICAL
     profile: unconditional
     category: privilege-escalation
@@ -375,6 +387,8 @@ items:
 
 - metadata:
     name: risky-secrets-read
+    summary: read Kubernetes Secrets
+    description: Reading Secrets exposes the credentials and sensitive data stored in them.
     priority: HIGH
     profile: namespaced-escalation
     category: credential-access
@@ -433,6 +447,8 @@ items:
 
 - metadata:
     name: risky-pods-create
+    summary: create Pods
+    description: Creating Pods can mount namespace Secrets and use any ServiceAccount in that namespace.
     priority: HIGH
     profile: workload-execution
     category: workload-execution

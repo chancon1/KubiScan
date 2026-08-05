@@ -10,6 +10,20 @@ Context-aware risk matrix. A finding's severity is now decided by where the
 permission was actually granted, not by a constant attached to the pattern.
 
 ### Added
+- Binding-centred risk events (`--risk-events`). One event represents one risky
+  pattern through one concrete RoleBinding or ClusterRoleBinding, so two grants
+  of the same ClusterRole no longer share a report record or explanation.
+- Structured event schema v2 with human-readable `Summary`, `Status`, `Risk`,
+  `Granted To`, matched `Permission`, `Role`, `Binding`, `Scope` and `Why` fields.
+  Multivalue fields remain JSON arrays instead of newline-delimited display text.
+- Stable SHA-256 `event_id` based on pattern, role and binding for tracking the same
+  grant across scans. Cluster context remains the responsibility of the log collector.
+- `ACTIVE` and `LATENT` event states. A binding with no subjects is latent and is
+  scored as an unbound grant rather than as active cluster-wide access.
+- Optional `summary`, `description` and `impact` vocabulary on matrix patterns;
+  patterns without it fall back to the exact permissions that matched.
+- `KUBISCAN_REPORT_MODE=events|roles` migration switch in the in-cluster entrypoint.
+  The event schema is the default; `roles` restores the previous JSON contract.
 - Context scoring engine (`engine/scoring.py`). Seven modifiers adjust a
   pattern's base priority and are applied in a fixed order, clamped to
   LOW..CRITICAL: `clusterWide`, `namespacedBindingOnly`, `sensitiveNamespace`,
@@ -47,6 +61,10 @@ permission was actually granted, not by a constant attached to the pattern.
   downstream by a log collector.
 
 ### Changed
+- The in-cluster Job now emits one JSON object per binding-centred risk event.
+  Legacy CLI reports and their JSON schema are unchanged.
+- Event system filtering hides only a `system:*` role reached through a
+  `system:*` binding. A custom binding to a built-in role remains visible.
 - RoleBindings and ClusterRoleBindings are scored per binding rather than
   inheriting the role's worst case. A ClusterRole granting
   `create clusterrolebindings` is critical behind a ClusterRoleBinding and

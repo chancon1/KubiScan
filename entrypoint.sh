@@ -25,12 +25,34 @@ EOF
 
 export KUBECONFIG=/tmp/kubeconfig
 
-python3 /opt/kubiscan/KubiScan.py \
-  -co /tmp/kubeconfig \
-  -ctx in-cluster \
-  -rar \
-  -r \
-  -j /tmp/report.json 2>&1 | tail -1
+REPORT_MODE="${KUBISCAN_REPORT_MODE:-events}"
+rm -f /tmp/report.json /tmp/kubiscan.log
+
+if [ "$REPORT_MODE" = "events" ]; then
+  if ! python3 /opt/kubiscan/KubiScan.py \
+    -q \
+    -co /tmp/kubeconfig \
+    -ctx in-cluster \
+    --risk-events \
+    -j /tmp/report.json >/tmp/kubiscan.log 2>&1; then
+    cat /tmp/kubiscan.log >&2
+    exit 1
+  fi
+elif [ "$REPORT_MODE" = "roles" ]; then
+  if ! python3 /opt/kubiscan/KubiScan.py \
+    -q \
+    -co /tmp/kubeconfig \
+    -ctx in-cluster \
+    -rar \
+    -r \
+    -j /tmp/report.json >/tmp/kubiscan.log 2>&1; then
+    cat /tmp/kubiscan.log >&2
+    exit 1
+  fi
+else
+  echo "KUBISCAN_REPORT_MODE must be 'events' or 'roles', got: $REPORT_MODE" >&2
+  exit 2
+fi
 
 python3 - <<'PYEOF'
 import json, datetime

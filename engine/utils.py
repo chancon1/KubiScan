@@ -384,7 +384,8 @@ def findings_for_binding(risky_role, rolebinding, kind, ctx):
     """
     scoped = ctx.scoped_to(BoundBinding(kind, rolebinding.metadata.name,
                                         rolebinding.metadata.namespace,
-                                        rolebinding.subjects))
+                                        rolebinding.subjects,
+                                        rolebinding.metadata.creation_timestamp))
     return score_findings_for_scope(risky_role.findings, risky_role, scoped, second_pass=True)
 
 
