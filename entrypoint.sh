@@ -73,7 +73,7 @@ labelled = len(sections) > 1
 
 for key, items in sections:
     for item in items:
-        event = {'scan_timestamp': ts, 'scan_tool': 'kubiscan'}
+        event = {'scan_timestamp': ts}
         if labelled:
             event['section'] = key
         event.update(item)

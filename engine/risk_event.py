@@ -1,10 +1,10 @@
 """Turn scored RBAC findings into compact, structured risk events.
 
-The unit of a schema-v4 event is one **distinct risk verdict**:
+The unit of a risk event is one **distinct risk verdict**:
 
     one role, one way of being granted, and everybody who holds it that way
 
-Earlier schemas emitted one event per matched pattern and binding. On a real
+Earlier revisions emitted one event per matched pattern and binding. On a real
 cluster that turned 59 risky roles into 471 records, and a ClusterRole handed to
 five hundred accounts through five hundred RoleBindings produced five hundred
 copies of the same review decision. Nothing there was wrong; it was just not
@@ -58,7 +58,6 @@ from misc.constants import (CLUSTER_ROLE_BINDING_KIND, CLUSTER_ROLE_KIND,
 
 STATUS_ACTIVE = 'ACTIVE'
 STATUS_LATENT = 'LATENT'
-EVENT_SCHEMA_VERSION = 4
 
 EVENT_TYPE_GRANT = 'rbac_grant'
 EVENT_TYPE_CHAIN = 'rbac_chain'
@@ -377,7 +376,6 @@ class RiskEvent(object):
 
     def to_dict(self):
         item = {
-            'schema_version': EVENT_SCHEMA_VERSION,
             'event_type': self.event_type,
             'event_id': self.event_id,
             'Summary': self.summary,
@@ -531,7 +529,6 @@ def _event_from_grants(grants, aggregated_from=None):
                            len(aggregated_from), '' if len(aggregated_from) == 1 else 's'))
 
     fields = {
-        'schema_version': EVENT_SCHEMA_VERSION,
         'event_type': EVENT_TYPE_GRANT,
         'event_id': 'x' * 64,
         'Summary': _summary_of(grants, strongest, scope, len(subject_lines)),

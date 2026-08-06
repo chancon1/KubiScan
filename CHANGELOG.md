@@ -39,7 +39,7 @@ permission was actually granted, not by a constant attached to the pattern.
   `privilegedSaReachable`. Priority is what to review first and adds where the
   grant lands and who holds it. Neither counts findings: a grant is worth its
   strongest one, and review order is Priority with Severity breaking ties.
-- Structured event schema v4 with human-readable `Summary`, `Priority`,
+- Structured event schema with human-readable `Summary`, `Priority`,
   `Severity`, `Status`, `Kind`, `Name`, `Namespace`, `Scope`, `Grant Count`,
   `Bound Service Accounts`, `RISK`, `Risk Count` and `Why` fields. `RISK` is one
   flat value per finding - `SEVERITY name [apiGroup] resource: verbs` - so a
@@ -107,7 +107,7 @@ permission was actually granted, not by a constant attached to the pattern.
   in-cluster Job manifest, full 471-event JSON report, and an execution summary.
   The Job completed successfully and every stdout line parsed as one schema-v2
   event without an embedded cluster-name field. The artifacts record that run;
-  the same cluster under schema v4 yields 49 verdict-level records instead.
+  the same cluster under the current schema yields 49 verdict-level records.
 
 ### Known limitations
 - Every Job run sends the full snapshot. There is no comparison with the previous
@@ -129,6 +129,9 @@ permission was actually granted, not by a constant attached to the pattern.
   base moved from the pinned `python:3.8.0-slim-buster` to `python:3.8-slim` -
   the same interpreter line on a newer Debian, 14 MB smaller. Verified by
   running the in-cluster Job on both: the 49 events are byte-identical.
+- Risk events no longer carry `schema_version` or `scan_tool`; both held the
+  same value on every line. The event shape is therefore not self-identifying,
+  and a future change to it has to be coordinated with whatever reads the index.
 - Risk events no longer carry `section` or `Review Order`. The first only ever
   held one value in this report - the legacy report needs it to tell its several
   sections apart, this one has exactly one - and the second was a sorted table's

@@ -304,7 +304,7 @@ def test_structured_contract(report):
     report('everyone binding gets a human summary',
            item['Summary'].startswith('All authenticated users can '), item['Summary'])
     report('machine schema fields remain present',
-           item['schema_version'] == 4 and item['event_type'] == 'rbac_grant'
+           item['event_type'] == 'rbac_grant'
            and item['Risk Count'] == 1 and item['Priority'] == 'CRITICAL'
            and item['Severity'] == 'HIGH', str(item))
     strings = [item['Summary'], item['Scope'], item['Grant Count']]
@@ -400,15 +400,16 @@ def test_static_scan_and_json_export(report):
     report('export keeps arrays and scan metadata intact',
            isinstance(items[0]['Bound Service Accounts'], list)
            and isinstance(items[0]['RISK'], list)
-           and items[0]['scan_tool'] == 'kubiscan'
            and 'scan_timestamp' in items[0]
            and 'Cluster Name' not in items[0], str(items[0]))
     # A constant on every line is not metadata, it is padding. 'section' told
     # the legacy report's sections apart and there is only one here; 'Review
     # Order' was a sorted table's row number, which churns between scans as
-    # unrelated roles come and go.
+    # unrelated roles come and go; 'scan_tool' and 'schema_version' never varied
+    # at all.
     report('the export carries no constant or churning padding',
-           'section' not in items[0] and 'Review Order' not in items[0],
+           not ({'section', 'Review Order', 'scan_tool', 'schema_version'}
+                & set(items[0])),
            str(sorted(items[0])))
 
 

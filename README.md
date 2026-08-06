@@ -278,7 +278,6 @@ namespace — which is exactly the set worth looking at.
 
 ```json
 {
-  "schema_version": 4,
   "event_type": "rbac_grant",
   "event_id": "51d3849de83b23e68084d35e470db11889eb74faa47a674f5c80711029681c89",
   "Summary": "500 subjects can exec into running containers, each in its own namespace",
@@ -541,37 +540,42 @@ object per event** on stdout so a log collector can pick them up line by line:
 
 ```json
 {
-  "scan_timestamp": "2026-08-04T19:51:00Z",
-  "scan_tool": "kubiscan",
-  "section": "RBAC Risk Events",
-  "schema_version": 2,
-  "event_type": "rbac_risk",
-  "event_id": "18bd6f3c6930a8556ac7a2a6bc3c50b665e87d1c8cd91b3f1ec582df943880da",
-  "Review Order": 1,
-  "Summary": "All authenticated users can read Kubernetes Secrets cluster-wide",
+  "scan_timestamp": "2026-08-06T19:21:58Z",
+  "event_type": "rbac_grant",
+  "event_id": "f3632e37ed9f121bd6eaa2622d481fd6dcc570eca40008a12385423e92d63b4b",
+  "Summary": "All authenticated users can create or modify ClusterRoleBindings cluster-wide",
   "Priority": "CRITICAL",
-  "Score": "HIGH -> CRITICAL",
+  "Severity": "CRITICAL",
   "Status": "ACTIVE",
-  "Risk": "risky-secrets-read",
-  "Granted To": ["Group system:authenticated"],
-  "Permission": ["[core] secrets: get,list,watch"],
-  "Role": "ClusterRole mock-secrets-reader-everyone",
-  "Binding": "ClusterRoleBinding too-open",
+  "Kind": "ClusterRole",
+  "Name": "kubiscan-mock-public-rbac-editor",
+  "Namespace": null,
   "Scope": "cluster-wide",
+  "Grant Count": "1 subject, 1 binding",
+  "Bound Service Accounts": [
+    "system:authenticated [Group] (via ClusterRoleBinding: kubiscan-mock-public-rbac-editor)"
+  ],
+  "RISK": [
+    "CRITICAL risky-clusterrolebindings-write      [rbac.authorization.k8s.io] clusterrolebindings: create,update,patch"
+  ],
+  "Risk Count": 1,
   "Why": [
-    "Reading Secrets exposes the credentials and sensitive data stored in them.",
-    "Cluster-wide via ClusterRoleBinding: too-open.",
-    "Granted to system:authenticated."
-  ]
+    "Changing ClusterRoleBindings can grant roles across the entire cluster.",
+    "Kubernetes prevents binding stronger roles unless the caller holds their permissions or has bind; review both permissions together.",
+    "Cluster-wide via ClusterRoleBinding: kubiscan-mock-public-rbac-editor."
+  ],
+  "Creation Time": "2026-08-05T21:10:50Z"
 }
 ```
 
-The multivalue fields (`Granted To`, `Permission`, `Why`) remain JSON arrays, so Splunk
-can search an individual subject or permission without parsing display text. The event
+The multivalue fields (`Bound Service Accounts`, `RISK`, `Why`) remain JSON arrays, so
+Splunk can search an individual subject or risk without parsing display text. The event
 itself is always one JSON line, so a collector never has to stitch one back together.
 
-Each event carries the scan timestamp, the report section it came from, and the report
-columns as-is. The Job is annotated for Splunk (`splunk.com/index`,
+Beyond the scan timestamp the event carries nothing constant: no tool name, no schema
+version, no section, no row number. One consequence is worth knowing - the shape is not
+self-identifying, so a future change to it has to be coordinated with whatever reads the
+index rather than being detected from the data. The Job is annotated for Splunk (`splunk.com/index`,
 `splunk.com/sourcetype`); adjust or drop those annotations to suit your collector.
 
 `event_id` is a stable SHA-256 fingerprint of pattern, role and binding. It stays the same
@@ -580,9 +584,11 @@ not add a cluster field: Fluent Bit or the Splunk agent should attach that deplo
 context. When correlating several clusters, use that external field together with
 `event_id` as the unique key.
 
-`Review Order` is calculated after sorting by priority, active/latent state, scope,
-sensitive namespace and subject exposure. It is intended as the default order inside one
-scan; `CRITICAL/ACTIVE` cluster-wide grants to broad groups come first.
+Events are printed in review order - priority, then severity, then active before latent,
+then scope, sensitive namespace and subject exposure - so `CRITICAL/ACTIVE` cluster-wide
+grants to broad groups come first. That order is not stamped on the event: a row number
+changes whenever an unrelated role appears elsewhere in the cluster, and a log store
+re-derives the ordering from whatever a query sorts by.
 
 The entrypoint defaults to the event schema. Set `KUBISCAN_REPORT_MODE=roles` to roll back
 to the legacy role-centred JSON without changing the image.
@@ -630,7 +636,7 @@ raise severity by itself. Subsequent scheduled scans should emit lifecycle chang
 (`new`, `changed`, `risk_increased`, `resolved`) plus one scan summary instead of sending
 an unchanged full snapshot.
 
-**Implemented since, as schema v4:** one event per distinct risk verdict, grants that
+**Implemented since:** one event per distinct risk verdict, grants that
 score alike counted rather than repeated, `aggregationRule` resolution, and the
 `Severity`/`Priority` split — see
 [grant-centred risk events](#grant-centred-risk-events). Re-running the same scan yields
