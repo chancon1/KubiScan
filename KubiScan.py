@@ -1004,13 +1004,17 @@ def print_table_aligned_left(table, export_json=True):
 def export_risk_events_to_json(events, filename):
     """Append a structured event section without routing it through a table."""
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    # No 'section' and no 'Review Order'. The first only ever holds one value
+    # here - the legacy report needs it to tell its several sections apart, this
+    # one has exactly one - and the second is the row number of a sorted table,
+    # which a log store re-derives from whatever a query orders by. Worse, the
+    # row number moves whenever an unrelated role appears elsewhere in the
+    # cluster, so it churns between scans while nothing about the risk changed.
     items = []
-    for review_order, event in enumerate(events, 1):
+    for event in events:
         item = {
             'scan_timestamp': timestamp,
             'scan_tool': 'kubiscan',
-            'section': 'RBAC Risk Events',
-            'Review Order': review_order,
         }
         item.update(event.to_dict())
         items.append(item)

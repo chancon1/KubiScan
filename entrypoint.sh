@@ -65,14 +65,17 @@ import json, datetime
 with open('/tmp/report.json') as f:
     data = json.load(f)
 ts = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-for section in data:
-    for key, items in section.items():
-        for item in items:
-            event = {
-                'scan_timestamp': ts,
-                'scan_tool': 'kubiscan',
-                'section': key,
-            }
-            event.update(item)
-            print(json.dumps(event))
+# 'section' tells the legacy report's several sections apart. The event report
+# has exactly one, where the field would carry no information at all, so it is
+# emitted only when there is something to distinguish.
+sections = [(key, items) for section in data for key, items in section.items()]
+labelled = len(sections) > 1
+
+for key, items in sections:
+    for item in items:
+        event = {'scan_timestamp': ts, 'scan_tool': 'kubiscan'}
+        if labelled:
+            event['section'] = key
+        event.update(item)
+        print(json.dumps(event))
 PYEOF

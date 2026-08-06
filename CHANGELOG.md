@@ -129,6 +129,11 @@ permission was actually granted, not by a constant attached to the pattern.
   base moved from the pinned `python:3.8.0-slim-buster` to `python:3.8-slim` -
   the same interpreter line on a newer Debian, 14 MB smaller. Verified by
   running the in-cluster Job on both: the 49 events are byte-identical.
+- Risk events no longer carry `section` or `Review Order`. The first only ever
+  held one value in this report - the legacy report needs it to tell its several
+  sections apart, this one has exactly one - and the second was a sorted table's
+  row number, which a log store re-derives from whatever a query orders by and
+  which churns between scans as unrelated roles come and go.
 - `.dockerignore` excludes `**/__pycache__` rather than `__pycache__`. The bare
   pattern only matches at the context root, so every `engine/__pycache__` was
   still being copied into the image.

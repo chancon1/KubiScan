@@ -400,9 +400,16 @@ def test_static_scan_and_json_export(report):
     report('export keeps arrays and scan metadata intact',
            isinstance(items[0]['Bound Service Accounts'], list)
            and isinstance(items[0]['RISK'], list)
-           and 'Cluster Name' not in items[0]
-           and items[0]['Review Order'] == 1
-           and items[0]['section'] == 'RBAC Risk Events', str(items[0]))
+           and items[0]['scan_tool'] == 'kubiscan'
+           and 'scan_timestamp' in items[0]
+           and 'Cluster Name' not in items[0], str(items[0]))
+    # A constant on every line is not metadata, it is padding. 'section' told
+    # the legacy report's sections apart and there is only one here; 'Review
+    # Order' was a sorted table's row number, which churns between scans as
+    # unrelated roles come and go.
+    report('the export carries no constant or churning padding',
+           'section' not in items[0] and 'Review Order' not in items[0],
+           str(sorted(items[0])))
 
 
 TESTS = [test_grants_with_different_reach_stay_apart,
