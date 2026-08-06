@@ -20,7 +20,7 @@ The tool was published as part of the "Securing Kubernetes Clusters by Eliminati
     - [From a remote with ServiceAccount token](#from-a-remote-with-serviceaccount-token)
   - [Scanning a static manifest dump](#scanning-a-static-manifest-dump)
 - [Reading the report](#reading-the-report)
-  - [Binding-centred risk events](#binding-centred-risk-events)
+  - [Grant-centred risk events](#grant-centred-risk-events)
 - [How a priority is decided](#how-a-priority-is-decided)
   - [The seven context modifiers](#the-seven-context-modifiers)
   - [Aggregation: always the maximum, never a sum](#aggregation-always-the-maximum-never-a-sum)
@@ -57,8 +57,8 @@ KubiScan gathers information about risky roles\clusterroles, rolebindings\cluste
 - CVE scan
 - EKS\AKS\GKE support
 - Scan an offline dump of manifests instead of a live cluster
-- Run as an in-cluster Job and emit one JSON event per risky pattern and concrete grant
-  for log collectors
+- Run as an in-cluster Job and emit one JSON event per resolved RBAC grant for log
+  collectors
 
 ## Usage
 ### Container
@@ -260,38 +260,52 @@ subject report hides a subject whose risk comes only from `system:*` roles. A cu
 binding to a built-in role remains visible in the binding report. Add `--include-system`
 to restore these objects. Pod/container reporting is unchanged.
 
-### Binding-centred risk events
+### Grant-centred risk events
 
-`--risk-events` is the compact log-collector view. Instead of putting every finding and
-every binding of a role into one large record, it emits one event for one risky pattern
-through one concrete binding:
+`--risk-events` is the compact log-collector view. It emits one event per **distinct risk
+verdict** — one role, one way of being granted, and everybody who holds it that way:
 
 ```
 python3 KubiScan.py --risk-events
 python3 KubiScan.py --risk-events -j report.json
 ```
 
-A ClusterRole referenced by a namespaced RoleBinding and a ClusterRoleBinding therefore
-becomes two events with different scopes and, when appropriate, different priorities.
-Each event answers the questions needed for review without printing the whole role:
+Grants that score identically share one event and are counted, so a ClusterRole handed to
+five hundred accounts through five hundred RoleBindings is one review decision rather than
+five hundred records. What splits an event out is a *different verdict* — a
+ClusterRoleBinding among the RoleBindings, or a grant that landed in a sensitive
+namespace — which is exactly the set worth looking at.
 
 ```json
 {
-  "Summary": "All authenticated users can read Kubernetes Secrets cluster-wide",
-  "Priority": "CRITICAL",
-  "Score": "HIGH -> CRITICAL",
+  "schema_version": 4,
+  "event_type": "rbac_grant",
+  "event_id": "51d3849de83b23e68084d35e470db11889eb74faa47a674f5c80711029681c89",
+  "Summary": "500 subjects can exec into running containers, each in its own namespace",
+  "Priority": "HIGH",
+  "Severity": "HIGH",
   "Status": "ACTIVE",
-  "Risk": "risky-secrets-read",
-  "Granted To": ["Group system:authenticated"],
-  "Permission": ["[core] secrets: get,list,watch"],
-  "Role": "ClusterRole secret-reader",
-  "Binding": "ClusterRoleBinding global-reader",
-  "Scope": "cluster-wide",
+  "Kind": "ClusterRole",
+  "Name": "namespace-developer",
+  "Namespace": null,
+  "Scope": "500 namespaces, all via RoleBinding",
+  "Grant Count": "500 subjects, 500 bindings in 500 namespaces",
+  "Bound Service Accounts": [
+    "developer-001@team-001 [SA NS] (via RoleBinding: team-001/nsdev-001)",
+    "developer-002@team-002 [SA NS] (via RoleBinding: team-002/nsdev-002)"
+  ],
+  "Bound Service Accounts Shown": "44 of 500",
+  "RISK": [
+    "HIGH     risky-pods-exec       [core] pods/exec: create",
+    "HIGH     risky-cronjobs        [batch] cronjobs: create,update,patch",
+    "MEDIUM   risky-configmaps-read [core] configmaps: get,list,watch"
+  ],
+  "Risk Count": 18,
   "Why": [
-    "Reading Secrets exposes the credentials and sensitive data stored in them.",
-    "Cluster-wide via ClusterRoleBinding: global-reader.",
-    "Granted to system:authenticated."
-  ]
+    "Creating Pods can mount namespace Secrets and use any ServiceAccount in that namespace.",
+    "The permission can create or control executable workloads."
+  ],
+  "Creation Time": "2026-08-06T15:21:12Z"
 }
 ```
 
@@ -299,18 +313,117 @@ Each event answers the questions needed for review without printing the whole ro
 `LATENT` means either that the role is unbound or that the binding has no subjects. The
 normal Role/ClusterRole and binding reports remain available and keep their old schema.
 
-Schema v2 is deliberately pattern-granular: a role that matches 20 patterns through one
-binding emits 20 events, and the Job emits the complete snapshot on every run. This gives
-precise evidence but can create high event volume in operator-heavy clusters. The
-[live-cluster validation](#live-cluster-validation) measured this effect. Grant-level
-aggregation, ClusterRole `aggregationRule` resolution, separate impact/review priority,
-and change-only emission are documented there as the next design iteration; they are not
-implemented in schema v2.
+#### Event identity
+
+`event_id` is derived from the role and its verdict, never from the members. Adding a
+service account to a role that already has five hundred reads as the same event with a
+bigger `Grant Count`, not as a new event on every scan — otherwise every scheduled scan
+would look like a fresh finding and dedup in the collector would be useless. A grant that
+scores differently does get its own id, because it is a different decision.
+
+#### RISK
+
+`RISK` is one flat value per finding — `SEVERITY  name  [apiGroup] resource: verbs` —
+ordered strongest first. It is a multivalue field on purpose, so `RISK="risky-pods-exec"`
+is searchable; a wrapped block of all findings in one string is neither readable nor
+searchable.
+
+#### How many accounts are listed
+
+`Bound Service Accounts` is fitted to a **byte budget**, not to a fixed number of names.
+A fixed cap cannot work: sixty accounts fit beside a role with 18 findings and overflow
+beside one with 64, and long names halve it again. The list therefore fills until the
+event reaches its budget, and `Grant Count` always reports the real total. When the list
+was shortened, `Bound Service Accounts Shown` says so.
+
+Splunk truncates a line at 10000 bytes by default and cuts the *tail*, which would leave
+invalid JSON rather than a shortened list — hence the budget, which defaults to 8000 with
+headroom. Raise it alongside the collector's own limit:
+
+```
+KUBISCAN_EVENT_BYTE_BUDGET=60000     # plus TRUNCATE = 65536 in props.conf
+```
+
+Measured on a role with 18 findings and 500 RoleBindings: 44 accounts listed at the
+default budget, around 480 with the raised one.
+
+#### Severity and Priority
+
+The two scores answer different questions and are deliberately kept apart.
+
+**`Severity`** is what the permission lets you do. Only modifiers that change the
+capability itself move it: `resourceNamesRestricted`, `namespacedBindingOnly` and
+`privilegedSaReachable`. The same rule is the same capability wherever it is bound.
+
+**`Priority`** is what to review first. It additionally weighs where the grant lands and
+who holds it — `clusterWide`, `sensitiveNamespace`, `boundToEveryone`, `unbound`.
+
+Neither is a count. A grant holding twenty risky permissions is not worse than the worst
+of them, so both take the strongest single finding; the other nineteen are evidence for
+the decision, not multipliers of it. Review order is `Priority` first, with `Severity`
+breaking its ties.
+
+#### Volume and aggregated ClusterRoles
+
+Schema v2 was pattern-granular: a role matching 20 patterns through one binding emitted 20
+events. On the [live-cluster validation](#live-cluster-validation) that turned 59 risky
+roles into 471 records, and one role bound to 500 accounts would have produced 500 copies
+of the same decision. Grouping by verdict brings the same cluster to 49 events and 81 KB,
+with no line over Splunk's default limit.
+
+Kubernetes fills an aggregated ClusterRole's rules from every ClusterRole matching its
+`aggregationRule` selectors, so those permissions would otherwise be reported twice: once
+on the parent that is actually bound, once on each source as a latent definition. The
+aggregation graph is resolved and a source is folded into its parent as an
+`Aggregated From` entry.
+
+Two kinds of source are never folded. One with a binding of its own is a grant somebody
+holds. One that is an aggregated ClusterRole itself is a composition point — the built-in
+`edit` carries the label feeding `admin`, but it has its own name, sources and bindings,
+and burying it inside `admin` would hide the role people actually reason about.
+
+Change-only emission and an approved baseline remain design guidance in the validation
+section; they need state between runs and are not implemented.
 
 System filtering is deliberately grant-aware in this view. Kubernetes' own `system:*`
 role plus `system:*` binding pairs are hidden by default, but a custom binding to a
 `system:*` role stays visible because it is a deliberate grant. `--include-system`
 restores everything.
+
+#### Escalation chains across several roles
+
+Some patterns are chains: `risky-chain-pod-and-secrets` needs *both* "create pods" and
+"read secrets". Matching one role at a time only finds those where a single role happens
+to grant both legs, which is not how privileges usually accumulate — they arrive through
+several bindings, and the subject holding them can do exactly what the one dangerous role
+could.
+
+`--risk-events` therefore also reports chains assembled from several roles. Such an event
+belongs to a subject rather than to a role, and names which role supplied which leg:
+
+```json
+{
+  "Summary": "ServiceAccount team-a/app can run a workload and read the credentials it can mount in namespace team-a, through 2 roles",
+  "Priority": "CRITICAL",
+  "Risk": "risky-chain-pod-and-secrets",
+  "Granted To": ["ServiceAccount team-a/app"],
+  "Role": "Role team-a/pod-runner + Role team-a/config-reader",
+  "Binding": "RoleBinding team-a/rb-pods + RoleBinding team-a/rb-secrets",
+  "Scope": "namespace team-a",
+  "Why": [
+    "No single role grants this; the subject assembles it from 2 separate grants.",
+    "[core] pods: create comes from Role team-a/pod-runner via RoleBinding team-a/rb-pods.",
+    "[core] secrets: get,list comes from Role team-a/config-reader via RoleBinding team-a/rb-secrets."
+  ]
+}
+```
+
+Legs are only combined where they actually meet. Permissions granted in different
+namespaces never form a chain, because creating a Pod in one namespace reaches no Secret
+in another; a ClusterRoleBinding applies everywhere and so joins every namespace, while a
+RoleBinding joins only its own. Subjects are followed one at a time, since two subjects
+sharing a binding do not pool their permissions. A chain a single role already grants is
+left to that role's own event instead of being reported twice.
 
 ## How a priority is decided
 
@@ -333,15 +446,20 @@ still there and still appears in the report - at LOW if everything argued agains
 
 ### The seven context modifiers
 
-| Modifier | Fires when | Effect |
-|---|---|---|
-| `clusterWide` | A ClusterRoleBinding grants the ClusterRole, so the permission covers every namespace | +1 |
-| `namespacedBindingOnly` | Only RoleBindings reference the ClusterRole. Binding a ClusterRole with a RoleBinding grants its namespaced rules inside that one namespace, so its **cluster-scoped** rules never take effect | -1 |
-| `sensitiveNamespace` | The grant lands in a namespace listed in `sensitive_namespaces.yaml`. Not applied on top of `clusterWide`, which already covers every namespace there is | +1 |
-| `boundToEveryone` | A binding hands the role to `system:authenticated` or `system:unauthenticated` | +1 |
-| `privilegedSaReachable` | The permission can run a workload in a namespace that hosts an already-critical service account. Creating a Pod lets you name any service account of that namespace as its identity | +1 |
-| `resourceNamesRestricted` | Every matched rule is pinned to named objects, on verbs RBAC actually narrows by name. `create`, `list`, `watch` and `deletecollection` are never narrowed, so mixing one of those in earns no discount | -1 |
-| `unbound` | No RoleBinding or ClusterRoleBinding references the role. A latent risk, not an active one | -1 |
+The **Moves** column says which score a modifier acts on. *Capability* modifiers change
+what the permission can do and therefore move both `Severity` and `Priority`; *exposure*
+modifiers change only how urgently it should be reviewed. See
+[Severity and Priority](#severity-and-priority).
+
+| Modifier | Fires when | Effect | Moves |
+|---|---|---|---|
+| `clusterWide` | A ClusterRoleBinding grants the ClusterRole, so the permission covers every namespace | +1 | exposure |
+| `namespacedBindingOnly` | Only RoleBindings reference the ClusterRole. Binding a ClusterRole with a RoleBinding grants its namespaced rules inside that one namespace, so its **cluster-scoped** rules never take effect | -1 | capability |
+| `sensitiveNamespace` | The grant lands in a namespace listed in `sensitive_namespaces.yaml`. Not applied on top of `clusterWide`, which already covers every namespace there is | +1 | exposure |
+| `boundToEveryone` | A binding hands the role to `system:authenticated` or `system:unauthenticated` | +1 | exposure |
+| `privilegedSaReachable` | The permission can run a workload in a namespace that hosts an already-critical service account. Creating a Pod lets you name any service account of that namespace as its identity | +1 | capability |
+| `resourceNamesRestricted` | Every rule granting the permission is pinned to named objects — one unrestricted rule beside a pinned one earns no discount. RBAC reads the object name from the request path, so a pinned rule grants nothing for `list`, `watch`, `deletecollection` or a `create` of a top-level resource; a `create` of a subresource carries its parent's name and is narrowed normally | -1 | capability |
+| `unbound` | Nobody holds the permission — either no binding references the role, or every binding that does has an empty subject list and therefore grants it to no one. A latent risk, not an active one | -1 | exposure |
 
 Not every pattern carries all seven. The set is chosen by the pattern's `profile`: recon
 permissions such as "list pods" only ever carry `unbound`, because almost every
@@ -385,6 +503,22 @@ kubiscan -rar --sensitive-namespaces-add prod,payments      # extend the shipped
 kubiscan -rar --sensitive-namespaces prod,payments          # replace it entirely
 ```
 
+An entry ending in `*` matches by **prefix**, which is how a distribution that names its
+platform namespaces from one stem is covered without listing each one:
+
+```yaml
+  shturval:
+    - 'shturval-*'        # shturval-monitoring, shturval-logging, ...
+```
+
+Everything else is an exact name on purpose — `infra` must not quietly cover
+`infra-sandbox`. Note the separator: `shturval-*` matches `shturval-monitoring` but not
+`shturvalx`, and not the bare stem `shturval`.
+
+A prefix is only right when *every* namespace under it is platform infrastructure. If
+application namespaces share the stem, they will be raised a level too and the modifier
+stops meaning anything — list those namespaces individually instead.
+
 The namespace that counts is the one where the grant **applies**: a Role's own namespace
 when something is bound to it, and the namespace of each RoleBinding for a ClusterRole. An
 unbound role has no place of effect and earns no namespace bump - `unbound` applies
@@ -402,7 +536,7 @@ kubectl -n kubiscan logs job/kubiscan-scan
 ```
 
 The container entry point (`entrypoint.sh`) builds a kubeconfig from the pod's service
-account token, runs the binding-centred `--risk-events` report, and prints **one JSON
+account token, runs the grant-centred `--risk-events` report, and prints **one JSON
 object per event** on stdout so a log collector can pick them up line by line:
 
 ```json
@@ -494,8 +628,18 @@ attack path; its review `Priority` additionally considers subject exposure, scop
 new/changed state, constraints and an explicitly approved baseline. Risk count does not
 raise severity by itself. Subsequent scheduled scans should emit lifecycle changes
 (`new`, `changed`, `risk_increased`, `resolved`) plus one scan summary instead of sending
-an unchanged full snapshot. This follow-up is design guidance from the validation and is
-not yet implemented.
+an unchanged full snapshot.
+
+**Implemented since, as schema v4:** one event per distinct risk verdict, grants that
+score alike counted rather than repeated, `aggregationRule` resolution, and the
+`Severity`/`Priority` split — see
+[grant-centred risk events](#grant-centred-risk-events). Re-running the same scan yields
+49 events and 81 KB, the four Kyverno `*:core` source roles fold into their parents, and
+no line exceeds the collector's default limit.
+
+**Still design guidance, not implemented:** the approved baseline keyed on a fingerprint
+of rules, binding and subjects, and change-only emission between scheduled scans. Both
+need state carried between runs, which the Job does not have today.
 
 Docker Desktop's existing network and non-shared `/sys/fs/bpf` mount prevented a safe
 Cilium datapath takeover. The test therefore kept Docker Desktop's CNI and ran Cilium in

@@ -1,18 +1,10 @@
 from engine.finding import AppliedModifier
 from engine.priority import Priority
 
-# Verbs that a 'resourceNames' restriction does NOT narrow. RBAC cannot restrict
-# 'create' by name (the object has none yet at authorization time), and a
-# collection request carries no name to match either. A wildcard verb includes
-# both, so it is listed here too.
-#
-# Everything else is narrowed, and stating it as a deny-list matters: the
-# name-restricted verbs that are easy to forget are exactly the dangerous ones -
-# 'use' on a PodSecurityPolicy, 'bind' and 'escalate' on a named role,
-# 'impersonate' on a named account, 'approve'/'sign' on a named signer. All of
-# those exist precisely to be pinned to specific objects.
-RESOURCE_NAME_IGNORING_VERBS = frozenset(
-    ['create', 'list', 'watch', 'deletecollection', '*'])
+# Which verbs a 'resourceNames' rule can and cannot grant is decided when the
+# rule is matched, by engine.rule.carries_object_name. By the time a finding
+# reaches this module the verbs a pinned rule grants nothing for are already
+# gone, so scoring only has to ask whether every granting rule was pinned.
 
 # Applied in this order, which is also the order they are shown in a report.
 MODIFIER_ORDER = [
@@ -28,6 +20,23 @@ MODIFIER_ORDER = [
 # Everything the second pass needs; the first pass skips these so that the
 # service-account map it feeds can be built without depending on itself.
 SECOND_PASS_MODIFIERS = frozenset(['privilegedSaReachable'])
+
+# Two questions, deliberately kept apart.
+#
+# Severity asks what the permission lets you do. Only modifiers that change the
+# capability itself belong to it: a name-pinned rule reaches fewer objects, an
+# inert cluster-scoped rule grants nothing, and a critical service account
+# standing next to a pod-creation right is a real escalation step.
+#
+# Priority asks how urgently a human should look, and adds where the grant lands
+# and who holds it. Those never change what the permission can do - the same
+# rule cluster-wide and in one team namespace is the same capability - but they
+# decide what gets reviewed first.
+CAPABILITY_MODIFIERS = frozenset([
+    'namespacedBindingOnly',
+    'privilegedSaReachable',
+    'resourceNamesRestricted',
+])
 
 _PRIORITY_BY_VALUE = {p.value: p for p in Priority}
 
@@ -47,7 +56,7 @@ def _cluster_wide(finding, role, ctx):
     """The binding names are detail only for --explain: the one-line form says
     'clusterWide', and the same event already lists every binding by name."""
     if ctx.is_cluster_wide(role):
-        names = [b.name for b in ctx.bindings_for(role) if b.is_cluster_wide]
+        names = [b.name for b in ctx.granting_bindings(role) if b.is_cluster_wide]
         return True, 'cluster-wide via ClusterRoleBinding: ' + ', '.join(sorted(names)), None
     return False, None, None
 
@@ -86,25 +95,43 @@ def _privileged_sa_reachable(finding, role, ctx):
 
 
 def _resource_names_restricted(finding, role, ctx):
-    """Every matched rule is pinned to named objects, on verbs that respect it."""
+    """Every rule granting this permission is pinned to named objects.
+
+    All of them, not one of them: a single unrestricted rule loses the discount
+    even when another rule of the same role is pinned, because the permission is
+    still reachable without naming an object.
+
+    Verbs a pinned rule cannot grant at all were already dropped when the rule
+    was matched, so whatever reaches this point really is narrowed by name.
+    """
     if not finding.rule_matches:
         return False, None, None
     names = []
     for match in finding.rule_matches:
-        restricted = getattr(match.source_rule, 'resource_names', None)
-        if not restricted:
-            return False, None, None
-        if set(v.lower() for v in match.matched_verbs) & RESOURCE_NAME_IGNORING_VERBS:
-            return False, None, None
-        names.extend(restricted)
+        for source_rule in match.source_rules:
+            restricted = getattr(source_rule, 'resource_names', None)
+            if not restricted:
+                return False, None, None
+            names.extend(restricted)
     shown = ', '.join(sorted(set(names)))
     return True, 'restricted to resourceNames: ' + shown, shown
 
 
 def _unbound(finding, role, ctx):
-    if not ctx.is_bound(role):
+    """Nobody holds this permission - the definition exists, the grant does not.
+
+    A binding whose subject list is empty lands here too, and saying that no
+    binding references the role would be false: one does, it just hands the role
+    to nobody. The distinction is what a reader needs to fix it.
+    """
+    if ctx.is_bound(role):
+        return False, None, None
+    bindings = ctx.bindings_for(role)
+    if not bindings:
         return True, 'no RoleBinding or ClusterRoleBinding references this role', None
-    return False, None, None
+    if len(bindings) == 1:
+        return True, 'the binding has no subjects, so nobody currently receives the grant', None
+    return True, 'no binding of this role has any subjects, so nobody receives the grant', None
 
 
 MODIFIER_EVALUATORS = {
@@ -119,8 +146,9 @@ MODIFIER_EVALUATORS = {
 
 
 def evaluate_modifiers(finding, role, ctx, second_pass=False):
-    """Return (delta, applied_modifiers) without touching the finding."""
-    delta = 0
+    """Return (capability_delta, exposure_delta, applied) without touching it."""
+    capability = 0
+    exposure = 0
     applied = []
     for name in MODIFIER_ORDER:
         configured = finding.pattern.modifiers.get(name)
@@ -133,9 +161,24 @@ def evaluate_modifiers(finding, role, ctx, second_pass=False):
             continue
         matched, explanation, detail = evaluator(finding, role, ctx)
         if matched:
-            delta += configured
+            if name in CAPABILITY_MODIFIERS:
+                capability += configured
+            else:
+                exposure += configured
             applied.append(AppliedModifier(name, configured, explanation, detail))
-    return delta, applied
+    return capability, exposure, applied
+
+
+def _verdict(base, capability, exposure):
+    """(severity, priority) from a base score and the two kinds of delta.
+
+    Priority is clamped once from the full sum rather than stacked on top of an
+    already-clamped severity. Clamping twice would quietly change scores that
+    have nothing to do with the split - a CRITICAL pattern pushed up by
+    capability and back down by exposure would come out a level lower than the
+    arithmetic says.
+    """
+    return adjust(base, capability), adjust(base, capability + exposure)
 
 
 def score_findings_for_scope(findings, role, ctx, second_pass=False):
@@ -147,27 +190,43 @@ def score_findings_for_scope(findings, role, ctx, second_pass=False):
     """
     scored = []
     for finding in findings:
-        delta, applied = evaluate_modifiers(finding, role, ctx, second_pass)
-        scored.append(finding.rescored(adjust(finding.base_priority, delta), applied))
+        capability, exposure, applied = evaluate_modifiers(finding, role, ctx, second_pass)
+        severity, priority = _verdict(finding.base_priority, capability, exposure)
+        scored.append(finding.rescored(severity, priority, applied))
     return scored
 
 
 def score_finding(finding, role, ctx, second_pass=False):
-    """Recompute a finding's effective priority from its base and the context.
+    """Recompute a finding's severity and priority from its base and context.
 
     Safe to call twice: the modifier list is rebuilt from scratch each time, so
     the second pass (which alone knows about privileged service accounts) does
     not double-count what the first already applied.
     """
-    delta, applied = evaluate_modifiers(finding, role, ctx, second_pass)
+    capability, exposure, applied = evaluate_modifiers(finding, role, ctx, second_pass)
     finding.modifiers = applied
-    finding.priority = adjust(finding.base_priority, delta)
+    finding.severity, finding.priority = _verdict(finding.base_priority, capability, exposure)
     return finding.priority
 
 
 def highest_priority(findings):
+    return _highest(findings, 'priority')
+
+
+def highest_severity(findings):
+    return _highest(findings, 'severity')
+
+
+def _highest(findings, attribute):
+    """The strongest single finding, never a sum.
+
+    Holding twenty risky permissions is not worse than holding the worst of
+    them: a count would let a noisy operator role outrank a quiet one that can
+    read every secret in the cluster.
+    """
     highest = Priority.NONE
     for finding in findings:
-        if finding.priority.value > highest.value:
-            highest = finding.priority
+        value = getattr(finding, attribute)
+        if value.value > highest.value:
+            highest = value
     return highest

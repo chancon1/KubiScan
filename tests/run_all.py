@@ -13,9 +13,9 @@ warnings.simplefilter('ignore')
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tests import test_events, test_matrix, test_scoring  # noqa: E402
+from tests import test_chains, test_events, test_matrix, test_scoring  # noqa: E402
 
-MODULES = [test_matrix, test_scoring, test_events]
+MODULES = [test_matrix, test_scoring, test_chains, test_events]
 
 
 def main():

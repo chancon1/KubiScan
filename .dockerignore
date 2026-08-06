@@ -24,9 +24,11 @@ build
 *.egg
 *.spec
 
-# Python bytecode and caches
-__pycache__
-*.py[cod]
+# Python bytecode and caches. The '**/' matters: a bare '__pycache__' pattern
+# only matches at the context root, so every engine/__pycache__ was still being
+# copied into the image.
+**/__pycache__
+**/*.py[cod]
 .mypy_cache
 .pytest_cache
 .coverage

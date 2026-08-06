@@ -79,6 +79,10 @@ class StaticApiClient(BaseApiClient):
             return V1ObjectMeta(
                 name=metadata_dict['name'],
                 namespace=metadata_dict.get('namespace'),
+                # Labels decide which ClusterRoles an aggregationRule collects,
+                # so dropping them here made every aggregated role look like it
+                # had no sources.
+                labels=metadata_dict.get('labels'),
                 creation_timestamp=creation_timestamp
             )
 
@@ -99,6 +103,11 @@ class StaticApiClient(BaseApiClient):
                         ) for rule in item.get('rules', [])
                     ]
             )
+            # V1Role carries no 'aggregation_rule' field - only V1ClusterRole
+            # does - but this client builds V1Role for both kinds. Attaching it
+            # keeps the dump and the live cluster answering the same question,
+            # and everything reads it through getattr.
+            v1_role.aggregation_rule = item.get('aggregationRule')
             v1_roles.append(v1_role)
         
         return V1RoleList(

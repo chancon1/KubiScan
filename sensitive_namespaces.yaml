@@ -8,6 +8,11 @@
 # because the first one sits next to Grafana admin credentials and a Splunk HEC
 # token while the second sits next to nothing.
 #
+# An entry ending in '*' matches by prefix, so a distribution that names its
+# platform namespaces from one stem needs one line rather than a list that goes
+# stale as soon as the platform grows a component. Everything else is an exact
+# name on purpose: 'infra' must not quietly cover 'infra-sandbox'.
+#
 # The groups are purely documentation - the scanner flattens them into one set.
 # Override the whole list from the command line with --sensitive-namespaces,
 # or add to it with --sensitive-namespaces-add.
@@ -19,6 +24,16 @@ groups:
     - kube-system
     - kube-public
     - kube-node-lease
+
+  # Shturval places its platform components under one prefix. Matched by prefix
+  # so that a component added later is covered without editing this file.
+  #
+  # Verify this against the cluster before relying on it: the prefix appears on
+  # the ClusterRole and ServiceAccount names too, and a role called
+  # 'shturval-cert-manager-cainjector' can perfectly well live in a namespace
+  # called plain 'cert-manager'. What belongs here is the namespace name.
+  shturval:
+    - 'shturval-*'
 
   # Rancher / RKE distributions place control-plane add-ons of their own here.
   rancher:

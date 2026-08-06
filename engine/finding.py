@@ -58,6 +58,35 @@ class RuleMatch:
         self.pattern_rule = pattern_rule
         self.matched_verbs = matched_verbs
         self.matched_resources = matched_resources
+        # Every rule of the role that grants this one pattern rule. Usually just
+        # the one, but a role can grant the same permission twice, and scoring
+        # has to see all of them: a 'resourceNames' restriction narrows the
+        # grant only when no unrestricted rule offers the same thing.
+        self.source_rules = [source_rule]
+
+    @classmethod
+    def merged(cls, matches):
+        """Fold every rule that satisfied one pattern rule into a single match.
+
+        Keeping only the first made two things go wrong. The verdict depended on
+        the order the rules happened to be written in, and a narrow rule could
+        hide a broad one standing right next to it - the shape every leader
+        election uses, where 'get'/'update' are pinned by name and 'create' is
+        not.
+        """
+        primary = matches[0]
+        if len(matches) == 1:
+            return primary
+        granted = set()
+        for match in matches:
+            granted.update(match.matched_verbs)
+        # Ordered by the pattern rather than by the role, so that two roles
+        # granting the same thing read identically in a report.
+        verbs = [verb for verb in (primary.pattern_rule.verbs or []) if verb in granted]
+        merged = cls(primary.source_rule, primary.pattern_rule, verbs,
+                     primary.matched_resources)
+        merged.source_rules = [match.source_rule for match in matches]
+        return merged
 
     def render(self):
         """e.g. "[core] secrets: get,list" - apiGroup included, not just the name."""
@@ -81,6 +110,11 @@ class Finding:
         self.pattern_name = pattern.name
         self.base_priority = pattern.base_priority
         self.category = pattern.category
+        # What the permission lets you do, once context has narrowed or widened
+        # the capability itself.
+        self.severity = pattern.base_priority
+        # The same, plus where the grant lands and who holds it. What a reviewer
+        # should look at first.
         self.priority = pattern.base_priority
         self.rule_matches = rule_matches or []
         self.modifiers = []
@@ -89,7 +123,7 @@ class Finding:
     def match_details(self):
         return [match.render() for match in self.rule_matches]
 
-    def rescored(self, priority, modifiers):
+    def rescored(self, severity, priority, modifiers):
         """A detached copy carrying the verdict of a narrower context.
 
         A single binding is a narrower scope than the role, and scoring one must
@@ -97,6 +131,7 @@ class Finding:
         every binding the role has, and both are reported.
         """
         copy = Finding(self.pattern, list(self.rule_matches))
+        copy.severity = severity
         copy.priority = priority
         copy.modifiers = list(modifiers)
         return copy

@@ -3,6 +3,7 @@ import requests
 from engine.role import Role
 from engine.priority import Priority
 from engine.finding import Finding, RuleMatch
+from engine.rule import carries_object_name
 from engine.scan_context import BoundBinding, ScanContext
 from engine.scoring import score_finding, score_findings_for_scope, highest_priority
 from static_risky_roles import STATIC_RISKY_ROLES
@@ -71,8 +72,8 @@ def _matched_verbs(source_rule, risky_rule):
 
     A source rule holding "*" grants every verb the pattern asks about, so the
     full pattern list is what got granted. This list is not cosmetic: scoring
-    reads it to decide whether a 'resourceNames' restriction is real, and
-    'resourceNames' does not constrain create/list/watch.
+    reads it to decide whether a 'resourceNames' restriction is real, and a
+    pinned rule does not grant every verb it lists.
     """
     source_verbs = source_rule.verbs or []
     source_has_wildcard = '*' in source_verbs
@@ -136,7 +137,20 @@ def is_rule_contains_risky_rule(source_rule, risky_rule):
         if not _resource_matches(source_rule.resources, resource):
             return None
 
-    return RuleMatch(source_rule, risky_rule, matched_verbs, list(risky_rule.resources or []))
+    matched_resources = list(risky_rule.resources or [])
+
+    # A 'resourceNames' rule only authorizes requests that name one of those
+    # objects. A verb whose request carries no name therefore gets nothing from
+    # such a rule - it is not granted broadly, it is not granted at all - so it
+    # must leave the match rather than sit in it looking unrestricted. If that
+    # empties the match, the pattern did not fire.
+    if getattr(source_rule, 'resource_names', None):
+        matched_verbs = [verb for verb in matched_verbs
+                         if carries_object_name(verb, matched_resources)]
+        if not matched_verbs:
+            return None
+
+    return RuleMatch(source_rule, risky_rule, matched_verbs, matched_resources)
 
 
 def get_current_version(certificate_authority_file=None, client_certificate_file=None, client_key_file=None, host=None):
@@ -180,18 +194,23 @@ def are_rules_contain_other_rules(source_rules, target_rules):
     A pattern holding more than one rule behaves as AND: all of its rules must
     be matched, possibly by different rules of the source role. That is what
     makes escalation-chain patterns ("create pods" AND "get secrets") work.
+
+    Every rule that satisfies a given pattern rule is kept, not just the first.
+    Stopping at the first one answered "does this match" correctly but left
+    scoring looking at an arbitrary rule, and whether a grant is restricted is a
+    fact about all the ways the role hands it out.
     """
     if not (target_rules and source_rules):
         return []
     matches = []
     for target_rule in target_rules:
-        for source_rule in source_rules:
-            match = is_rule_contains_risky_rule(source_rule, target_rule)
-            if match is not None:
-                matches.append(match)
-                break
-        else:
+        granting = [match for match in
+                    (is_rule_contains_risky_rule(source_rule, target_rule)
+                     for source_rule in source_rules)
+                    if match is not None]
+        if not granting:
             return []
+        matches.append(RuleMatch.merged(granting))
     return matches
 
 
@@ -272,6 +291,10 @@ def scan_roles_and_clusterroles(force=False):
     for kind in (ROLE_KIND, CLUSTER_ROLE_KIND):
         all_roles = get_roles_by_kind(kind)
         if all_roles is not None:
+            # Recorded before the risky ones are picked out: a subject can
+            # complete an escalation chain out of roles that are individually
+            # dull, and those rules are needed to see it.
+            ctx.record_roles(all_roles.items, kind)
             risky_roles += find_risky_roles(all_roles.items, kind, ctx)
 
     # The first pass scored everything except the one modifier that has to know

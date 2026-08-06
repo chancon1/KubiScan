@@ -109,22 +109,31 @@ def print_risk_events(include_system=False):
 
     global curr_header
     curr_header = '|RBAC Risk Events|'
-    columns = ['Priority', 'Score', 'Status', 'Summary', 'Risk', 'Granted To',
-               'Permission', 'Role', 'Binding', 'Scope', 'Why']
+    # One row per distinct risk verdict. Grants that score identically share a
+    # row and are counted, so five hundred RoleBindings to one role read as one
+    # decision rather than five hundred.
+    columns = ['Priority', 'Severity', 'Status', 'Summary', 'Kind', 'Name',
+               'Namespace', 'Scope', 'Grant Count', 'Bound Service Accounts',
+               'RISK', 'Why']
     table = PrettyTable(columns)
     table.hrules = ALL
     for event in events:
+        subjects = list(event.subject_lines)
+        if event.subjects_truncated:
+            subjects.append('... {0} of {1} shown'.format(
+                len(subjects), event.subjects_total))
         table.add_row([
             get_color_by_priority(event.priority) + event.priority.name + WHITE,
-            event.score,
+            event.severity.name,
             event.status,
             event.summary,
-            event.risk_name,
-            '\n'.join(event.subjects) or 'Nobody',
-            '\n'.join(event.permissions),
-            event.role,
-            event.binding,
+            event.role.kind,
+            event.role.name,
+            event.role.namespace or '-',
             event.scope,
+            event.grant_count,
+            '\n'.join(subjects) or 'Nobody',
+            '\n'.join(event.risk_lines),
             '\n'.join(event.reasons),
         ])
     # Risk events have their own structured exporter. Running the legacy table

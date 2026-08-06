@@ -12,7 +12,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine.finding import Finding  # noqa: E402
 from engine.priority import Priority  # noqa: E402
-from engine.scan_context import BoundBinding, ScanContext  # noqa: E402
+from engine.scan_context import (BoundBinding, ScanContext,  # noqa: E402
+                                 is_sensitive_namespace, load_sensitive_namespaces)
 from engine.scoring import (MODIFIER_ORDER, score_finding,  # noqa: E402
                             score_findings_for_scope)
 from engine.utils import are_rules_contain_other_rules  # noqa: E402
@@ -101,14 +102,14 @@ def test_modifiers(report):
          ('risky-secrets-read', ROLE_PLAIN, context({ROLE_PLAIN_KEY: [RB_PLAIN]}),
           [rule([''], ['secrets'], ['get'], resource_names=['one'])]),
          Priority.MEDIUM, ['resourceNamesRestricted']),
-        ('resourceNames earns nothing once list is among the matched verbs',
+        ('resourceNames still narrows when a collection verb sits beside get',
          ('risky-secrets-read', ROLE_PLAIN, context({ROLE_PLAIN_KEY: [RB_PLAIN]}),
           [rule([''], ['secrets'], ['get', 'list'], resource_names=['one'])]),
-         Priority.HIGH, []),
-        ('resourceNames earns nothing on create',
-         ('risky-secrets-write', ROLE_PLAIN, context({ROLE_PLAIN_KEY: [RB_PLAIN]}),
-          [rule([''], ['secrets'], ['create'], resource_names=['one'])]),
-         Priority.HIGH, []),
+         Priority.MEDIUM, ['resourceNamesRestricted']),
+        ('resourceNames narrows a subresource create',
+         ('risky-serviceaccount-token', ROLE_PLAIN, context({ROLE_PLAIN_KEY: [RB_PLAIN]}),
+          [rule([''], ['serviceaccounts/token'], ['create'], resource_names=['one'])]),
+         Priority.HIGH, ['resourceNamesRestricted']),
         ('resourceNames applies to use, cancelling clusterWide',
          ('risky-podsecuritypolicies-use', CR, context({CR_KEY: [CRB]}),
           [rule(['policy'], ['podsecuritypolicies'], ['use'], resource_names=['p'])]),
@@ -130,6 +131,89 @@ def test_modifiers(report):
         report(label,
                priority == expected_priority and modifiers == expected_modifiers,
                'got {0} {1}'.format(priority.name, modifiers))
+
+
+PINNED_GET = rule([''], ['secrets'], ['get', 'update'], resource_names=['one'])
+OPEN_CREATE = rule([''], ['secrets'], ['create'])
+
+
+def test_resource_names_follow_rbac(report):
+    """A pinned rule is worth what RBAC actually grants through it.
+
+    RBAC reads the object name from the request path. That makes 'resourceNames'
+    a real restriction on some verbs, a grant of nothing on others, and the
+    difference decides both whether a pattern fires and what it scores.
+    """
+    def matches(pattern_name, rules):
+        pattern = next(p for p in STATIC_RISKY_ROLES if p.name == pattern_name)
+        return are_rules_contain_other_rules(rules, pattern.rules)
+
+    # A create of a top-level resource never names an object, so the rule
+    # authorizes no create at all and there is nothing to report.
+    report('a pinned top-level create grants nothing and does not fire',
+           not matches('risky-secrets-write',
+                       [rule([''], ['secrets'], ['create'], resource_names=['one'])]),
+           'pattern still fired')
+
+    # A subresource create names its parent, which is how token minting is
+    # scoped, so the pattern must fire and keep the discount.
+    report('a pinned subresource create still fires',
+           bool(matches('risky-serviceaccount-token',
+                        [rule([''], ['serviceaccounts/token'], ['create'],
+                              resource_names=['one'])])),
+           'pattern did not fire')
+
+    # The leader-election shape: one rule pinned by name, one not. The pin is
+    # not a restriction on the role, only on one of its two rules.
+    both_orders = []
+    for label, rules in (('pinned first', [PINNED_GET, OPEN_CREATE]),
+                         ('unpinned first', [OPEN_CREATE, PINNED_GET])):
+        priority, modifiers = score('risky-secrets-write', ROLE_PLAIN,
+                                    context({ROLE_PLAIN_KEY: [RB_PLAIN]}), rules)
+        both_orders.append((priority, modifiers))
+        report('an unrestricted rule beside a pinned one loses the discount, '
+               + label,
+               modifiers == [],
+               'got {0} {1}'.format(priority.name, modifiers))
+
+    report('rule order does not change the verdict',
+           both_orders[0] == both_orders[1],
+           'got {0} then {1}'.format(*both_orders))
+
+    # Both rules grant part of what the pattern asks for, and the report should
+    # say so rather than name whichever rule was written first.
+    matched = matches('risky-secrets-write', [PINNED_GET, OPEN_CREATE])
+    verbs = matched[0].matched_verbs if matched else []
+    report('the match reports every verb the role grants',
+           verbs == ['create', 'update'],
+           'got {0}'.format(verbs))
+
+
+def test_sensitive_namespaces_match_by_name_and_prefix(report):
+    """A distribution's platform namespaces share a stem; app namespaces must not.
+
+    The dangerous direction here is over-matching: a prefix that also swallows
+    team namespaces raises half the cluster by one level and the modifier stops
+    meaning anything.
+    """
+    patterns = set(['kube-system', 'infra', 'shturval-*'])
+    cases = [
+        ('an exact name still matches', 'kube-system', True),
+        ('an unlisted namespace does not', 'team-a', False),
+        ('a prefix entry covers what grows under it', 'shturval-monitoring', True),
+        ('a prefix entry needs its separator', 'shturvalx', False),
+        ('a prefix entry does not match the stem alone', 'shturval', False),
+        ('an exact entry never becomes a prefix', 'infra-sandbox', False),
+    ]
+    for label, namespace, expected in cases:
+        report(label, is_sensitive_namespace(namespace, patterns) == expected,
+               '{0} -> {1}'.format(namespace, is_sensitive_namespace(namespace, patterns)))
+
+    shipped = load_sensitive_namespaces()
+    report('the shipped list still covers the Kubernetes control plane',
+           all(is_sensitive_namespace(ns, shipped)
+               for ns in ('kube-system', 'kube-public', 'kube-node-lease')),
+           str(sorted(shipped)[:5]))
 
 
 def test_binding_scope_is_explained_and_isolated(report):
@@ -209,6 +293,8 @@ def test_first_pass_defers_service_account_modifier(report):
 
 
 TESTS = [test_modifiers,
+         test_resource_names_follow_rbac,
+         test_sensitive_namespaces_match_by_name_and_prefix,
          test_binding_scope_is_explained_and_isolated,
          test_report_vocabulary_is_ascii,
          test_first_pass_defers_service_account_modifier]

@@ -10,14 +10,53 @@ Context-aware risk matrix. A finding's severity is now decided by where the
 permission was actually granted, not by a constant attached to the pattern.
 
 ### Added
-- Binding-centred risk events (`--risk-events`). One event represents one risky
-  pattern through one concrete RoleBinding or ClusterRoleBinding, so two grants
-  of the same ClusterRole no longer share a report record or explanation.
-- Structured event schema v2 with human-readable `Summary`, `Status`, `Risk`,
-  `Granted To`, matched `Permission`, `Role`, `Binding`, `Scope` and `Why` fields.
-  Multivalue fields remain JSON arrays instead of newline-delimited display text.
-- Stable SHA-256 `event_id` based on pattern, role and binding for tracking the same
-  grant across scans. Cluster context remains the responsibility of the log collector.
+- Cross-role escalation chains (`engine/subject_chain.py`), reported as risk
+  events. A chain pattern such as "create pods" AND "read secrets" used to fire
+  only where one role granted both legs; privileges normally accumulate through
+  several bindings instead, and the subject holding them can do exactly what the
+  single role could. Such an event belongs to a subject rather than a role and
+  names which role supplied which leg. Legs are only combined where they meet:
+  never across namespaces, never across subjects, and a chain a single role
+  already grants is left to that role's own event.
+- Grant-centred risk events (`--risk-events`). One event represents one distinct
+  risk verdict: one role, one way of being granted, and everybody who holds it
+  that way. Grants that score identically are counted rather than repeated, so a
+  ClusterRole handed to five hundred accounts through five hundred RoleBindings
+  is one review decision instead of five hundred records. What splits an event
+  out is a different verdict - a ClusterRoleBinding among the RoleBindings, or a
+  grant in a sensitive namespace - which is exactly the set worth looking at.
+  The live-cluster validation's 471 pattern records become 49 events and 81 KB,
+  with no line over the collector's default limit.
+- `aggregationRule` resolution. Kubernetes fills an aggregated ClusterRole's
+  rules from every ClusterRole matching its selectors, so those permissions used
+  to be reported twice - once on the bound parent and once on each source as a
+  latent definition. Sources now fold into the parent as `Aggregated From`.
+  A source keeps its own event when it is bound in its own right, or when it is
+  an aggregated ClusterRole itself: burying the built-in `edit` inside `admin`
+  would hide the role people actually reason about.
+- Separate `Severity` and `Priority`. Severity is what the permission lets you
+  do and moves only with `resourceNamesRestricted`, `namespacedBindingOnly` and
+  `privilegedSaReachable`. Priority is what to review first and adds where the
+  grant lands and who holds it. Neither counts findings: a grant is worth its
+  strongest one, and review order is Priority with Severity breaking ties.
+- Structured event schema v4 with human-readable `Summary`, `Priority`,
+  `Severity`, `Status`, `Kind`, `Name`, `Namespace`, `Scope`, `Grant Count`,
+  `Bound Service Accounts`, `RISK`, `Risk Count` and `Why` fields. `RISK` is one
+  flat value per finding - `SEVERITY name [apiGroup] resource: verbs` - so a
+  collector can search `RISK="risky-pods-exec"`; a wrapped block of every finding
+  in one string is neither readable nor searchable. It replaces the earlier
+  schemas outright; there is no switch back, because none of them were released.
+- Stable SHA-256 `event_id` derived from the role and its verdict, never from the
+  members. Adding a service account to a role that already has five hundred reads
+  as the same event with a bigger `Grant Count`, not as a new finding on every
+  scheduled scan, which would make dedup in the collector useless. Cluster context
+  remains the responsibility of the log collector.
+- `Bound Service Accounts` fitted to a byte budget rather than to a fixed number
+  of names, because the same sixty accounts fit beside a role with 18 findings
+  and overflow beside one with 64. `Grant Count` always reports the real total and
+  `Bound Service Accounts Shown` says when the list was shortened. Set
+  `KUBISCAN_EVENT_BYTE_BUDGET` alongside the collector's own line limit to list
+  more: measured 44 accounts at the 8000-byte default, around 480 at 60000.
 - `ACTIVE` and `LATENT` event states. A binding with no subjects is latent and is
   scored as an unbound grant rather than as active cluster-wide access.
 - Optional `summary`, `description` and `impact` vocabulary on matrix patterns;
@@ -31,8 +70,8 @@ permission was actually granted, not by a constant attached to the pattern.
   `unbound`. A match never decays to NONE - context can make a finding less
   urgent, but the permission is still there.
 - `engine/scan_context.py` - binding index built once per scan, sensitive
-  namespace list, privileged service-account map, and `SingleBindingContext`
-  for scoring one binding in isolation.
+  namespace list, privileged service-account map, and `FixedBindingsContext`
+  for scoring a narrower set of bindings in isolation.
 - Two-pass scan (`scan_roles_and_clusterroles`). The first pass scores
   everything except `privilegedSaReachable`; the map of already-critical
   service accounts is built from its result, then the second pass settles the
@@ -47,7 +86,11 @@ permission was actually granted, not by a constant attached to the pattern.
   apiGroup and one line per modifier with its delta and reason.
 - `engine/risky_pattern.py` - a matrix entry is a pattern, not a `Role`.
 - `sensitive_namespaces.yaml` plus `--sensitive-namespaces` and
-  `--sensitive-namespaces-add` to replace or extend the shipped list.
+  `--sensitive-namespaces-add` to replace or extend the shipped list. An entry
+  ending in `*` matches by prefix, so a distribution naming its platform
+  namespaces from one stem takes one line instead of a list that goes stale as
+  soon as the platform grows a component. Everything else stays an exact name:
+  `infra` must not quietly cover `infra-sandbox`.
 - `profiles:` block in `risky_roles.yaml`; patterns gained `scope`, `appliesTo`,
   `profile`, `modifiers`, `category` and `matchesAnyApiGroup`.
 - Matrix grew from 80 to 170 patterns across 10 categories, 76 of them
@@ -63,23 +106,33 @@ permission was actually granted, not by a constant attached to the pattern.
   `artifacts/live-cluster-2026-08-06`: mock RBAC, nginx workload and Ingress,
   in-cluster Job manifest, full 471-event JSON report, and an execution summary.
   The Job completed successfully and every stdout line parsed as one schema-v2
-  event without an embedded cluster-name field.
+  event without an embedded cluster-name field. The artifacts record that run;
+  the same cluster under schema v4 yields 49 verdict-level records instead.
 
 ### Known limitations
-- Schema v2 emits one event per matched pattern and concrete binding, then sends
-  the full snapshot on every Job run. The live test showed 471 events from only
-  59 risky roles, including 224 Kyverno events. The documented follow-up is one
-  compact event per resolved Role+Binding, full findings kept as structured
-  evidence, change-only lifecycle emission, and a separate scan summary.
-- Kubernetes ClusterRole aggregation is not resolved before event generation.
-  Aggregated component roles can therefore appear as separate `LATENT` events
-  while their rules also appear in the bound parent role.
-- Potential impact and review urgency are both represented by `Priority` today.
-  The follow-up design separates technical `Severity` from context/baseline-aware
-  review `Priority`; this has not yet changed the schema or scorer.
+- Every Job run sends the full snapshot. There is no comparison with the previous
+  scan, so an unchanged cluster produces an unchanged full report rather than
+  `new`/`changed`/`risk_increased`/`resolved` records plus a summary.
+- There is no approved baseline. A grant an operator legitimately needs is scored
+  exactly like an unexpected one with the same capability, so trusted-component
+  context has to be applied downstream. The documented design keys approval on a
+  fingerprint of rules, binding and subjects so that drift becomes reviewable
+  again; both it and lifecycle emission need state carried between runs, which
+  the Job does not have.
 
 ### Changed
-- The in-cluster Job now emits one JSON object per binding-centred risk event.
+- The container image is 56 MB, down from 76 MB. Dependencies are installed
+  into a directory of their own and copied from there, so the runtime no longer
+  carries pip, setuptools, wheel or a second copy of whatever the base image
+  already had under `/usr/local`; `--no-compile` keeps bytecode caches, a build
+  artefact of the machine that compiled them, out of the image entirely. The
+  base moved from the pinned `python:3.8.0-slim-buster` to `python:3.8-slim` -
+  the same interpreter line on a newer Debian, 14 MB smaller. Verified by
+  running the in-cluster Job on both: the 49 events are byte-identical.
+- `.dockerignore` excludes `**/__pycache__` rather than `__pycache__`. The bare
+  pattern only matches at the context root, so every `engine/__pycache__` was
+  still being copied into the image.
+- The in-cluster Job now emits one JSON object per grant-centred risk event.
   Legacy CLI reports and their JSON schema are unchanged.
 - Event system filtering hides only a `system:*` role reached through a
   `system:*` binding. A custom binding to a built-in role remains visible.
@@ -102,6 +155,32 @@ permission was actually granted, not by a constant attached to the pattern.
   whether a `resourceNames` restriction narrows anything.
 
 ### Fixed
+- A binding with an empty subject list grants its role to nobody, and every
+  question about reach now answers accordingly. The role reports were reading
+  reach from any binding that named the role, so a subject-less
+  ClusterRoleBinding scored the role as an active cluster-wide grant while the
+  event view called the same object latent. Kubernetes ships exactly such a
+  binding - `ClusterRoleBinding system:node` is empty on a kubeadm cluster -
+  which inflated seventeen findings of `system:node` on every scan.
+- `unbound` no longer claims that no binding references the role when one does
+  and simply has no subjects. The two need different fixes, so they now read
+  differently.
+- A `resourceNames` discount now requires *every* rule granting the permission
+  to be pinned, not whichever rule the matcher happened to reach first. A role
+  writing `get`/`update` against a named object and an unrestricted `create`
+  beside it - the shape every leader election uses - was scored as if the
+  `create` were pinned too, and the verdict changed if the two rules were
+  swapped in the manifest.
+- A matched rule now reports every verb the role grants for it, gathered across
+  all the rules that grant it, instead of only those of the first one found.
+- `resourceNames` is applied the way RBAC applies it, by asking whether the
+  request carries an object name at all. A pinned rule grants nothing for
+  `list`, `watch`, `deletecollection` or a `create` of a top-level resource, so
+  those verbs leave the match instead of counting as unrestricted access, and a
+  pattern left with no verbs no longer fires at all. A `create` of a subresource
+  does carry its parent's name, so pinning `serviceaccounts/token` to one
+  account - the documented way to scope token minting - now earns the discount
+  it always deserved.
 - The `Rules` column no longer ends in a stray newline, which rendered as an
   empty line in the table and as a blank field line in the JSON events.
 - The table caps its free-text columns at 55 characters and wraps instead of

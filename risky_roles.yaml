@@ -48,13 +48,19 @@
 #                           pod lets you name any service account of that
 #                           namespace as its identity, so the permission is worth
 #                           as much as the best identity standing next to it.
-#   resourceNamesRestricted Every matched rule is pinned to named objects, on
-#                           verbs that RBAC actually narrows by name. 'create'
-#                           and collection requests ('list', 'watch',
-#                           'deletecollection') are never narrowed, so mixing
-#                           those in earns no discount. Everything else is -
-#                           including 'use', 'bind', 'escalate', 'impersonate'
-#                           and 'approve', which exist to be pinned by name.
+#   resourceNamesRestricted Every rule granting the permission is pinned to
+#                           named objects. All of them: one unrestricted rule
+#                           beside a pinned one earns no discount, because the
+#                           permission is still reachable without naming an
+#                           object. RBAC reads that name from the request path,
+#                           so a pinned rule grants nothing for a collection
+#                           request ('list', 'watch', 'deletecollection') or for
+#                           a 'create' of a top-level resource - those verbs are
+#                           dropped from the match rather than counted as
+#                           unrestricted. A 'create' of a subresource does carry
+#                           the parent's name ('serviceaccounts/<name>/token'),
+#                           and is narrowed like 'use', 'bind', 'escalate',
+#                           'impersonate' and 'approve'.
 #   unbound                 No RoleBinding or ClusterRoleBinding references the
 #                           role. A latent risk, not an active one.
 #
@@ -482,6 +488,7 @@ items:
 # Risk: Direct arbitrary command execution inside running pods
 - metadata:
     name: risky-pods-exec
+    summary: exec into running containers
     priority: HIGH
     profile: namespaced-escalation
     category: workload-execution
@@ -492,6 +499,7 @@ items:
 
 - metadata:
     name: risky-pods-attach
+    summary: attach to running containers
     priority: HIGH
     profile: namespaced-escalation
     category: workload-execution
@@ -503,6 +511,7 @@ items:
 # Risk: Port-forwarding exposes internal services and bypasses NetworkPolicy
 - metadata:
     name: risky-pods-portforward
+    summary: forward ports into the pod network
     priority: HIGH
     profile: namespaced-escalation
     category: network
@@ -2109,6 +2118,13 @@ items:
     priority: CRITICAL
     profile: namespaced-escalation
     category: privilege-escalation
+    summary: create an identity and grant it permissions
+    description: >-
+      Creating ServiceAccounts and creating RoleBindings together is a complete
+      privilege-escalation path that needs no existing privileged account
+    impact: >-
+      An attacker can make a new identity and bind it to any role they are
+      already able to grant, then act as it
   rules:
   - apiGroups: [""]
     resources: ["serviceaccounts"]
@@ -2123,6 +2139,13 @@ items:
     priority: CRITICAL
     profile: namespaced-escalation
     category: credential-access
+    summary: run a workload and read the credentials it can mount
+    description: >-
+      Creating Pods and reading Secrets in the same namespace lets a workload be
+      run under any identity there and its mounted credentials read back
+    impact: >-
+      An attacker can take over any ServiceAccount of the namespace and keep its
+      token after the pod is gone
   rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -2138,6 +2161,13 @@ items:
     priority: CRITICAL
     profile: namespaced-escalation
     category: credential-access
+    summary: enumerate service accounts and mint tokens for them
+    description: >-
+      Listing ServiceAccounts and creating tokens for them together lets the
+      most privileged account of the namespace be found and then impersonated
+    impact: >-
+      An attacker gets a working token for an account of their choosing, without
+      creating any object that would show up in the namespace
   rules:
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]

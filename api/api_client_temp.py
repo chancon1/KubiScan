@@ -672,6 +672,11 @@ class ApiClientTemp(object):
         cluster_roles = []
         for i in json_data[0]['items']:
             metadata = V1ObjectMeta(name=i['metadata']['name'],
+                                    # Labels decide which ClusterRoles an
+                                    # aggregationRule collects. Without them
+                                    # every aggregated role looks sourceless and
+                                    # its sources look like separate risks.
+                                    labels=i['metadata'].get('labels'),
                                     creation_timestamp=self._ApiClientTemp__deserialize_datatime(
                                         i['metadata']['creationTimestamp']))
 
@@ -688,6 +693,10 @@ class ApiClientTemp(object):
                                               non_resource_ur_ls=rule.get('nonResourceURLs')))
 
             cluster_role = V1ClusterRole(kind='ClusterRole', metadata=metadata, rules=rules)
+            # Kept as the raw JSON: the resolver normalises either shape, and
+            # this is what tells it that these rules were collected from other
+            # ClusterRoles rather than written here.
+            cluster_role.aggregation_rule = i.get('aggregationRule')
             cluster_roles.append(cluster_role)
 
         return V1ClusterRoleList(items=cluster_roles)

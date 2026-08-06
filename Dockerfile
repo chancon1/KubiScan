@@ -1,8 +1,12 @@
 # Default to the Docker Hub container registry
 ARG DOCKER_REGISTRY=index.docker.io
 
-# Default to the official Python Debian image
-ARG PYTHON_IMAGE=${DOCKER_REGISTRY}/python:3.8.0-slim-buster
+# Default to the official Python Debian image.
+#
+# The floating 3.8 tag rather than the pinned 3.8.0: it is the same interpreter
+# line on a newer Debian, and the buster image it replaces carried 14 MB of
+# distribution that nothing here uses. Override PYTHON_IMAGE to pin a build.
+ARG PYTHON_IMAGE=${DOCKER_REGISTRY}/python:3.8-slim
 
 
 FROM ${PYTHON_IMAGE} AS build-image
@@ -19,12 +23,24 @@ COPY requirements.txt requirements.txt
 # should contain all packages necessary to run the Python source for the
 # project. As such changes to the dependencies would merely warrant a change to
 # the requirements.txt file, while the Dockerfile files remain unaffected.
-RUN pip3 install -r requirements.txt
+# Installed into a directory of their own so that the runtime stage can take the
+# dependencies and nothing else. Copying the whole of /usr/local also carried
+# pip, setuptools and wheel - build tooling with no business in a scanner - plus
+# a second copy of anything the base image already had at that path.
+#
+# --no-compile keeps the bytecode caches out. They are a build artefact of the
+# machine that compiled them, Python rebuilds what it needs at import time, and
+# across 140 package directories they are not a rounding error.
+RUN pip3 install --no-compile --no-cache-dir --target=/deps -r requirements.txt
 
 
 FROM ${PYTHON_IMAGE} AS run-image
-# Copy Python packages installed in the build stage
-COPY --from=build-image /usr/local /usr/local
+
+# Only the dependencies, dropped where the interpreter already looks for them.
+COPY --from=build-image /deps /usr/local/lib/python3.8/site-packages
+
+# Fail the build here rather than at the first scan if the trimming went too far.
+RUN PYTHONDONTWRITEBYTECODE=1 python3 -c 'import kubernetes, prettytable, yaml, requests'
 
 # Copy source
 COPY . /opt/kubiscan

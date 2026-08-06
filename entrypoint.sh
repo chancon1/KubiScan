@@ -26,6 +26,12 @@ EOF
 export KUBECONFIG=/tmp/kubeconfig
 
 REPORT_MODE="${KUBISCAN_REPORT_MODE:-events}"
+
+# How many bytes one event may occupy before the bound-account list stops
+# growing. Keep it below the collector's line limit: Splunk truncates at
+# 10000 bytes by default and cuts the tail, which would leave invalid JSON.
+# Raise both together to get longer account lists.
+export KUBISCAN_EVENT_BYTE_BUDGET="${KUBISCAN_EVENT_BYTE_BUDGET:-8000}"
 rm -f /tmp/report.json /tmp/kubiscan.log
 
 if [ "$REPORT_MODE" = "events" ]; then
