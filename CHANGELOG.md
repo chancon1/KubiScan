@@ -91,6 +91,16 @@ permission was actually granted, not by a constant attached to the pattern.
   namespaces from one stem takes one line instead of a list that goes stale as
   soon as the platform grows a component. Everything else stays an exact name:
   `infra` must not quietly cover `infra-sandbox`.
+  The shipped list now carries the infrastructure namespaces seen on a real
+  platform cluster - ingress and mesh (`ingress`, `higress-system`, `kube-vip`),
+  storage and backup (`snapshotter`, `rawfile-provisioner`, `velero`),
+  observability (`victoria-metrics`, `coroot-clickhouse`, `monq`), delivery
+  (`argo-events`, `image-tracker`, `dragonfly-system`), scanning
+  (`trivy-system`, `kubiscan`) and `kubernetes-dashboard` - regrouped by what
+  each namespace holds rather than by which vendor ships it. `velero` matters
+  most of the set: backup tooling reads every Secret in the cluster by design.
+  A new guard in `tests/test_scoring.py` fails if the list ever starts matching
+  ordinary application namespaces.
 - `profiles:` block in `risky_roles.yaml`; patterns gained `scope`, `appliesTo`,
   `profile`, `modifiers`, `category` and `matchesAnyApiGroup`.
 - Matrix grew from 80 to 170 patterns across 10 categories, 76 of them

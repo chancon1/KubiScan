@@ -215,6 +215,22 @@ def test_sensitive_namespaces_match_by_name_and_prefix(report):
                for ns in ('kube-system', 'kube-public', 'kube-node-lease')),
            str(sorted(shipped)[:5]))
 
+    # The shipped list is long enough that a mistyped entry - a stray '*', or a
+    # stem short enough to swallow whatever grows beside it - would raise a
+    # large part of an ordinary cluster without anybody noticing. These are the
+    # names a platform namespace is most likely to be confused with.
+    application = ['default', 'team-a', 'infra-sandbox', 'ingress-team',
+                   'monitoring-demo', 'argocd-apps', 'velero-test',
+                   'logging-staging', 'shturval', 'kubiscan-risk-lab']
+    swallowed = [ns for ns in application if is_sensitive_namespace(ns, shipped)]
+    report('the shipped list does not swallow application namespaces',
+           not swallowed, 'raised by the shipped list: {0}'.format(swallowed))
+
+    prefixes = sorted(entry for entry in shipped if entry.endswith('*'))
+    report('every prefix entry ends at a separator',
+           all(entry.endswith('-*') for entry in prefixes),
+           'prefix entries: {0}'.format(prefixes))
+
 
 def test_binding_scope_is_explained_and_isolated(report):
     """A binding reports its own verdict, its own reason, and nothing else's.

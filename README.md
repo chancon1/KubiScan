@@ -493,9 +493,15 @@ the report names the binding that has to be fixed.
 
 ### Sensitive namespaces
 
-`sensitive_namespaces.yaml` ships the list that `sensitiveNamespace` uses: the Kubernetes
-control plane (`kube-system`, `kube-public`, `kube-node-lease`) plus common policy,
-ingress and infrastructure namespaces. Tune it to the cluster:
+`sensitive_namespaces.yaml` ships the list that `sensitiveNamespace` uses, grouped by what
+the namespace actually holds: the Kubernetes control plane (`kube-system`, `kube-public`,
+`kube-node-lease`), policy and runtime security (`kyverno`, `gatekeeper-system`,
+`tetragon`, `trivy-system`, …), secret and certificate delivery (`cert-manager`,
+`external-secrets`), ingress and mesh (`ingress`, `ingress-nginx`, `istio-system`,
+`higress-system`, `kube-vip`), storage and backup (`longhorn-system`, `velero`,
+`snapshotter`, …), observability (`monitoring`, `logging`, `splunk`, `victoria-metrics`,
+`coroot`, …) and delivery (`argocd`, `argo-events`, `dragonfly-system`, …). The groups are
+documentation only — the scanner flattens them into one set. Tune it to the cluster:
 
 ```
 kubiscan -rar --sensitive-namespaces-add prod,payments      # extend the shipped list

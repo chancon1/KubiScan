@@ -28,10 +28,15 @@ groups:
   # Shturval places its platform components under one prefix. Matched by prefix
   # so that a component added later is covered without editing this file.
   #
-  # Verify this against the cluster before relying on it: the prefix appears on
-  # the ClusterRole and ServiceAccount names too, and a role called
-  # 'shturval-cert-manager-cainjector' can perfectly well live in a namespace
-  # called plain 'cert-manager'. What belongs here is the namespace name.
+  # Confirmed against a live cluster: shturval-cd, shturval-cert-expiration,
+  # shturval-node-config-system, shturval-rollouts, shturval-services-system,
+  # shturval-trust-manager and shturval-update-system are all platform
+  # components, and no application namespace shares the stem.
+  #
+  # The prefix appears on ClusterRole and ServiceAccount names too, and a role
+  # called 'shturval-cert-manager-cainjector' can perfectly well live in a
+  # namespace called plain 'cert-manager'. What belongs here is the namespace
+  # name - the components that live outside the prefix are listed below.
   shturval:
     - 'shturval-*'
 
@@ -41,33 +46,71 @@ groups:
     - cattle-prometheus
     - cattle-monitoring-system
     - fleet-system
-    - ingress-nginx
 
-  # Policy enforcement and runtime security. A subject able to write here can
-  # switch off the control that is supposed to catch everything else.
+  # Policy enforcement, admission and runtime security. A subject able to write
+  # here can switch off the control that is supposed to catch everything else -
+  # including this scanner, whose own service account reads the whole cluster.
   policy_and_runtime_security:
     - kyverno
     - gatekeeper-system
     - opa
     - tetragon
     - node-problem-detector
+    - trivy-system
+    - kubiscan
 
-  # Platform infrastructure: secret delivery, certificates, GitOps, storage and
-  # observability. Each of these holds credentials for something outside the
-  # cluster, or the ability to deploy into every other namespace.
-  infrastructure:
-    - argocd
+  # Secret and certificate delivery. Each of these mints or syncs credentials
+  # for every other namespace, so a grant here is a grant everywhere.
+  secrets_and_certificates:
     - cert-manager
     - external-secrets
+
+  # Ingress and service mesh. These terminate TLS for the cluster's traffic and
+  # hold the certificates and keys that go with it; kube-vip additionally owns
+  # the control-plane VIP.
+  networking_and_ingress:
+    - ingress
+    - ingress-nginx
     - istio-system
-    - infra
-    - logging
-    - monitoring
-    - splunk
-    - coroot
-    - cadvisor
-    - goldilocks
+    - higress-system
+    - kube-vip
+
+  # Storage, snapshots and backup. Backup tooling reads every Secret and
+  # ConfigMap in the cluster by design and writes them to object storage, so its
+  # namespace is worth as much as the cluster it protects.
+  storage_and_backup:
     - longhorn-system
     - csi-s3
     - nfs-sc
     - goofys
+    - rawfile-provisioner
+    - snapshotter
+    - velero
+
+  # Observability. Metrics, logs and traces from every workload land here,
+  # together with the credentials for whatever they are shipped to.
+  observability:
+    - monitoring
+    - logging
+    - splunk
+    - cadvisor
+    - coroot
+    - coroot-clickhouse
+    - victoria-metrics
+    - monq
+    - goldilocks
+
+  # GitOps, delivery and image distribution. A subject able to write here
+  # deploys into every namespace the pipeline can reach, or replaces the images
+  # the cluster pulls.
+  delivery_and_images:
+    - argocd
+    - argo-events
+    - image-tracker
+    - dragonfly-system
+
+  # Remaining platform infrastructure, including the web console: a grant in the
+  # dashboard's namespace reaches the token it authenticates with.
+  infrastructure:
+    - infra
+    - kubernetes-dashboard
