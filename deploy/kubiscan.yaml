@@ -71,7 +71,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: kubiscan
-          image: chancon17/kubiscan:v2
+          image: chancon17/kubiscan:v3
           imagePullPolicy: Always
           env:
             - name: KUBISCAN_REPORT_MODE
